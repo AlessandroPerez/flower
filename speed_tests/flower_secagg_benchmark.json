@@ -1,0 +1,14 @@
+[
+  {
+    "n": 10,
+    "dropout_rate": 0.0,
+    "impl": "classical",
+    "time_seconds": 1.0
+  },
+  {
+    "n": 10,
+    "dropout_rate": 0.01,
+    "impl": "classical",
+    "time_seconds": 2.0
+  }
+]

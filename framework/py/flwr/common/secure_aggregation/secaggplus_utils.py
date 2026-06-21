@@ -80,6 +80,68 @@ def share_keys_plaintext_separate(plaintext: bytes) -> tuple[int, int, bytes, by
     return ret
 
 
+def share_keys_plaintext_concat_rd(
+    src_node_id: int, dst_node_id: int, rd_seed_share: bytes
+) -> bytes:
+    """Combine a single rd_seed share into bytes."""
+    return b"".join(
+        [
+            int.to_bytes(src_node_id, 8, "little", signed=False),
+            int.to_bytes(dst_node_id, 8, "little", signed=False),
+            int.to_bytes(len(rd_seed_share), 4, "little"),
+            rd_seed_share,
+        ]
+    )
+
+
+def share_keys_plaintext_separate_rd(plaintext: bytes) -> tuple[int, int, bytes]:
+    """Retrieve src, dst, and rd_seed_share from bytes."""
+    src = int.from_bytes(plaintext[:8], "little", signed=False)
+    dst = int.from_bytes(plaintext[8:16], "little", signed=False)
+    mark = int.from_bytes(plaintext[16:20], "little")
+    rd_seed_share = plaintext[20 : 20 + mark]
+    return src, dst, rd_seed_share
+
+
+def share_keys_plaintext_concat_ps(
+    src_node_id: int, dst_node_id: int, ps_shares: list[tuple[int, bytes]]
+) -> bytes:
+    """Combine pairwise-secret shares into bytes.
+
+    Each element of ``ps_shares`` is a tuple ``(owner_node_id, share_bytes)``,
+    where ``owner_node_id`` is the client that created the pairwise secret.
+    """
+    parts: list[bytes] = [
+        int.to_bytes(src_node_id, 8, "little", signed=False),
+        int.to_bytes(dst_node_id, 8, "little", signed=False),
+        int.to_bytes(len(ps_shares), 4, "little"),
+    ]
+    for owner_node_id, share in ps_shares:
+        parts.append(int.to_bytes(owner_node_id, 8, "little", signed=False))
+        parts.append(int.to_bytes(len(share), 4, "little"))
+        parts.append(share)
+    return b"".join(parts)
+
+
+def share_keys_plaintext_separate_ps(
+    plaintext: bytes,
+) -> tuple[int, int, list[tuple[int, bytes]]]:
+    """Retrieve src, dst, and pairwise-secret shares from bytes."""
+    src = int.from_bytes(plaintext[:8], "little", signed=False)
+    dst = int.from_bytes(plaintext[8:16], "little", signed=False)
+    num_shares = int.from_bytes(plaintext[16:20], "little")
+    offset = 20
+    ps_shares: list[tuple[int, bytes]] = []
+    for _ in range(num_shares):
+        owner = int.from_bytes(plaintext[offset : offset + 8], "little", signed=False)
+        offset += 8
+        length = int.from_bytes(plaintext[offset : offset + 4], "little")
+        offset += 4
+        ps_shares.append((owner, plaintext[offset : offset + length]))
+        offset += length
+    return src, dst, ps_shares
+
+
 def pseudo_rand_gen(
     seed: bytes, num_range: int, dimensions_list: list[tuple[int, ...]]
 ) -> list[NDArrayInt]:

@@ -53,8 +53,13 @@ class Key:
     MAX_WEIGHT = "max_weight"
     PUBLIC_KEY_1 = "pk1"
     PUBLIC_KEY_2 = "pk2"
+    PUBLIC_KEY_PAIRWISE = "pk_pairwise"
+    PUBLIC_KEY_SHARE_ENC = "pk_share_enc"
+    SINGLE_KEM = "single_kem"
     DESTINATION_LIST = "dsts"
     CIPHERTEXT_LIST = "ctxts"
+    CIPHERTEXT_PAIRWISE_LIST = "ct_pairwise_list"
+    CIPHERTEXT_SHARE_ENC_LIST = "ct_share_enc_list"
     SOURCE_LIST = "srcs"
     PARAMETERS = "params"
     MASKED_PARAMETERS = "masked_params"
@@ -62,6 +67,7 @@ class Key:
     DEAD_NODE_ID_LIST = "dead_nids"
     NODE_ID_LIST = "nids"
     SHARE_LIST = "shares"
+    PAIRWISE_SECRET_SHARE_LIST = "ps_shares"
 
     def __new__(cls) -> Key:
         """Prevent instantiation."""
