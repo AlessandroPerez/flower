@@ -65,9 +65,14 @@ class Key:
     MASKED_PARAMETERS = "masked_params"
     ACTIVE_NODE_ID_LIST = "active_nids"
     DEAD_NODE_ID_LIST = "dead_nids"
+    STAGE3_DEAD_NODE_ID_LIST = "stage3_dead_nids"
     NODE_ID_LIST = "nids"
     SHARE_LIST = "shares"
     PAIRWISE_SECRET_SHARE_LIST = "ps_shares"
+    SELF_MASK_SHARE_LIST = "self_mask_shares"
+    SELF_MASK = "self_mask"
+    SUM_DERIVED_KEYS = "sum_derived_keys"
+    E_VALUE = "e_value"
 
     def __new__(cls) -> Key:
         """Prevent instantiation."""

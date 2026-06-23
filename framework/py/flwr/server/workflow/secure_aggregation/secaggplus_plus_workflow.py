@@ -1,0 +1,708 @@
+# Copyright 2025 Flower Labs GmbH. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Workflow for the SecAggPlusPlus protocol."""
+
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+from logging import DEBUG, ERROR, INFO
+from typing import cast
+
+import flwr.compat.common.recorddict_compat as compat
+from flwr.app import ConfigRecord, Context, Message, RecordDict
+from flwr.app.message_type import MessageType
+from flwr.common import FitRes, NDArrays, bytes_to_ndarray, log, ndarrays_to_parameters
+from flwr.common.secure_aggregation.crypto.degree_threshold import (
+    compute_degree_and_threshold,
+)
+from flwr.common.secure_aggregation.crypto.shamir import combine_shares
+from flwr.common.secure_aggregation.ndarrays_arithmetic import (
+    factor_extract,
+    get_parameters_shape,
+    parameters_addition,
+    parameters_mod,
+    parameters_subtraction,
+)
+from flwr.common.secure_aggregation.quantization import dequantize
+from flwr.common.secure_aggregation.secaggplus_constants import (
+    RECORD_KEY_CONFIGS,
+    Key,
+    Stage,
+)
+from flwr.common.secure_aggregation.secaggplus_utils import (
+    derive_pairwise_key,
+    pseudo_rand_gen,
+)
+from flwr.server.client_proxy import ClientProxy
+from flwr.server.compat.legacy_context import LegacyContext
+from flwr.serverapp.grid import Grid
+
+from ..constant import MAIN_CONFIGS_RECORD, MAIN_PARAMS_RECORD
+from ..constant import Key as WorkflowKey
+
+
+@dataclass
+class WorkflowState:  # pylint: disable=R0902
+    """The state of the SecAggPlusPlus protocol."""
+
+    nid_to_proxies: dict[int, ClientProxy] = field(default_factory=dict)
+    nid_to_fitins: dict[int, RecordDict] = field(default_factory=dict)
+    sampled_node_ids: set[int] = field(default_factory=set)
+    active_node_ids: set[int] = field(default_factory=set)
+    num_shares: int = 0
+    threshold: int = 0
+    clipping_range: float = 0.0
+    quantization_range: int = 0
+    mod_range: int = 0
+    max_weight: float = 0.0
+    nid_to_neighbours: dict[int, set[int]] = field(default_factory=dict)
+    nid_to_publickeys: dict[int, bytes] = field(default_factory=dict)
+    forward_srcs: dict[int, list[int]] = field(default_factory=dict)
+    forward_ciphertexts: dict[int, list[bytes]] = field(default_factory=dict)
+    aggregate_ndarrays: NDArrays = field(default_factory=list)
+    sum_derived: dict[int, NDArrays] = field(default_factory=dict)
+    masked_params: dict[int, NDArrays] = field(default_factory=dict)
+    legacy_results: list[tuple[ClientProxy, FitRes]] = field(default_factory=list)
+    failures: list[Exception] = field(default_factory=list)
+
+
+class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
+    """The SecAggPlusPlus workflow.
+
+    This workflow implements the seed-based post-quantum SecAgg+ variant
+    described in ``pqc_aggregation.md``: each client derives pairwise masks
+    from a master seed shared with neighbours via a PQ PKE, and a separate
+    self mask is removed after the server commits to the participant set.
+    """
+
+    def __init__(  # pylint: disable=R0913
+        self,
+        num_shares: int | float | None = None,
+        reconstruction_threshold: int | float | None = None,
+        *,
+        gamma: float = 0.2,
+        delta: float = 0.2,
+        sigma: int = 40,
+        eta: int = 30,
+        max_weight: float = 1000.0,
+        clipping_range: float = 8.0,
+        quantization_range: int = 4194304,
+        modulus_range: int = 4294967296,
+        timeout: float | None = None,
+    ) -> None:
+        self.num_shares = num_shares
+        self.reconstruction_threshold = reconstruction_threshold
+        self.gamma = gamma
+        self.delta = delta
+        self.sigma = sigma
+        self.eta = eta
+        self.max_weight = max_weight
+        self.clipping_range = clipping_range
+        self.quantization_range = quantization_range
+        self.modulus_range = modulus_range
+        self.timeout = timeout
+
+        self._check_init_params()
+
+    def __call__(self, grid: Grid, context: Context) -> None:
+        """Run the SecAggPlusPlus protocol."""
+        if not isinstance(context, LegacyContext):
+            raise TypeError(
+                f"Expect a LegacyContext, but get {type(context).__name__}."
+            )
+        state = WorkflowState()
+
+        steps = (
+            self.setup_stage,
+            self.share_keys_stage,
+            self.collect_masked_vectors_stage,
+            self.unmask_stage,
+        )
+        log(INFO, "SecAggPlusPlus secure aggregation commencing.")
+        for step in steps:
+            if not step(grid, context, state):
+                log(INFO, "SecAggPlusPlus secure aggregation halted.")
+                return
+        log(INFO, "SecAggPlusPlus secure aggregation completed.")
+
+    def _check_init_params(self) -> None:  # pylint: disable=R0912
+        if self.num_shares is not None and not isinstance(
+            self.num_shares, (int | float)
+        ):
+            raise TypeError("`num_shares` must be of type int, float, or None.")
+        if isinstance(self.num_shares, int) and self.num_shares <= 2:
+            raise ValueError("`num_shares` as an integer must be greater than 2.")
+        if isinstance(self.num_shares, float) and not 0.0 < self.num_shares <= 1.0:
+            raise ValueError("If `num_shares` is a float, it must be in (0, 1].")
+
+        if self.reconstruction_threshold is not None and not isinstance(
+            self.reconstruction_threshold, (int | float)
+        ):
+            raise TypeError(
+                "`reconstruction_threshold` must be of type int, float, or None."
+            )
+        if (
+            isinstance(self.reconstruction_threshold, int)
+            and self.reconstruction_threshold < 1
+        ):
+            raise ValueError(
+                "`reconstruction_threshold` as an integer must be at least 1."
+            )
+        if (
+            isinstance(self.reconstruction_threshold, float)
+            and not 0.0 < self.reconstruction_threshold <= 1.0
+        ):
+            raise ValueError(
+                "If `reconstruction_threshold` is a float, it must be in (0, 1]."
+            )
+
+        if not 0.0 <= self.gamma < 1.0:
+            raise ValueError("`gamma` must be in [0, 1).")
+        if not 0.0 <= self.delta < 1.0:
+            raise ValueError("`delta` must be in [0, 1).")
+        if self.gamma + self.delta >= 1.0:
+            raise ValueError("`gamma + delta` must be < 1.")
+        if self.sigma <= 0 or self.eta <= 0:
+            raise ValueError("`sigma` and `eta` must be positive.")
+
+        if self.max_weight <= 0:
+            raise ValueError("`max_weight` must be greater than 0.")
+        if self.quantization_range <= 0:
+            raise ValueError("`quantization_range` must be greater than 0.")
+        if (
+            not isinstance(self.modulus_range, int)
+            or self.modulus_range <= self.quantization_range
+        ):
+            raise ValueError(
+                "`modulus_range` must be an integer and greater than "
+                "`quantization_range`."
+            )
+        if bin(self.modulus_range).count("1") != 1:
+            raise ValueError("`modulus_range` must be a power of 2.")
+
+    def _check_threshold(self, state: WorkflowState) -> bool:
+        for node_id in state.sampled_node_ids:
+            active_neighbors = state.nid_to_neighbours[node_id] & state.active_node_ids
+            if len(active_neighbors) < state.threshold:
+                log(ERROR, "Insufficient available nodes.")
+                return False
+        return True
+
+    def setup_stage(  # pylint: disable=R0912, R0914, R0915
+        self, grid: Grid, context: LegacyContext, state: WorkflowState
+    ) -> bool:
+        """Execute the 'setup' stage."""
+        cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+        current_round = cast(int, cfg[WorkflowKey.CURRENT_ROUND])
+        parameters = compat.arrayrecord_to_parameters(
+            context.state.array_records[MAIN_PARAMS_RECORD],
+            keep_input=True,
+        )
+        proxy_fitins_lst = context.strategy.configure_fit(
+            current_round, parameters, context.client_manager
+        )
+        if not proxy_fitins_lst:
+            log(INFO, "configure_fit: no clients selected, cancel")
+            return False
+        log(
+            INFO,
+            "configure_fit: strategy sampled %s clients (out of %s)",
+            len(proxy_fitins_lst),
+            context.client_manager.num_available(),
+        )
+
+        state.nid_to_fitins = {
+            proxy.node_id: compat.fitins_to_recorddict(fitins, True)
+            for proxy, fitins in proxy_fitins_lst
+        }
+        state.nid_to_proxies = {proxy.node_id: proxy for proxy, _ in proxy_fitins_lst}
+
+        sampled_node_ids = list(state.nid_to_fitins.keys())
+        num_samples = len(sampled_node_ids)
+        if num_samples < 2:
+            log(ERROR, "The number of samples should be greater than 1.")
+            return False
+
+        if self.num_shares is None:
+            k_adaptive, t_adaptive = compute_degree_and_threshold(
+                num_samples, self.gamma, self.delta, self.sigma, self.eta
+            )
+            state.num_shares = k_adaptive
+            state.threshold = t_adaptive
+        else:
+            if isinstance(self.num_shares, float):
+                state.num_shares = round(self.num_shares * num_samples)
+                if state.num_shares < num_samples and state.num_shares & 1 == 0:
+                    state.num_shares += 1
+                if state.num_shares <= 2:
+                    state.num_shares = num_samples
+            else:
+                state.num_shares = self.num_shares
+
+            if self.reconstruction_threshold is None:
+                raise ValueError(
+                    "`reconstruction_threshold` must be provided when "
+                    "`num_shares` is explicit."
+                )
+            if isinstance(self.reconstruction_threshold, float):
+                state.threshold = max(
+                    2, round(self.reconstruction_threshold * state.num_shares)
+                )
+            else:
+                state.threshold = self.reconstruction_threshold
+
+        state.num_shares = min(state.num_shares, num_samples)
+        state.num_shares = min(num_samples, max(state.num_shares, 3))
+        if state.num_shares % 2 == 0:
+            state.num_shares -= 1
+
+        if not 1 < state.threshold < state.num_shares:
+            log(ERROR, "Invalid threshold / num_shares combination.")
+            return False
+
+        state.clipping_range = self.clipping_range
+        state.quantization_range = self.quantization_range
+        state.mod_range = self.modulus_range
+        state.max_weight = self.max_weight
+        sa_params_dict = {
+            Key.STAGE: Stage.SETUP,
+            Key.SAMPLE_NUMBER: num_samples,
+            Key.SHARE_NUMBER: state.num_shares,
+            Key.THRESHOLD: state.threshold,
+            Key.CLIPPING_RANGE: self.clipping_range,
+            Key.TARGET_RANGE: self.quantization_range,
+            Key.MOD_RANGE: state.mod_range,
+            Key.MAX_WEIGHT: self.max_weight,
+        }
+
+        random.shuffle(sampled_node_ids)
+        half_share = state.num_shares >> 1
+        state.nid_to_neighbours = {
+            nid: {
+                sampled_node_ids[(idx + offset) % num_samples]
+                for offset in range(-half_share, half_share + 1)
+            }
+            for idx, nid in enumerate(sampled_node_ids)
+        }
+
+        state.sampled_node_ids = set(sampled_node_ids)
+        state.active_node_ids = set(sampled_node_ids)
+
+        cfg_record = ConfigRecord(sa_params_dict)  # type: ignore
+        content = RecordDict({RECORD_KEY_CONFIGS: cfg_record})
+
+        def make(nid: int) -> Message:
+            return Message(
+                content=content,
+                dst_node_id=nid,
+                message_type=MessageType.TRAIN,
+                group_id=str(cfg[WorkflowKey.CURRENT_ROUND]),
+            )
+
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 0] Sending configurations to %s clients.",
+            len(state.active_node_ids),
+        )
+        msgs = grid.send_and_receive(
+            [make(node_id) for node_id in state.active_node_ids], timeout=self.timeout
+        )
+        state.active_node_ids = {
+            msg.metadata.src_node_id for msg in msgs if not msg.has_error()
+        }
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 0] Received public keys from %s clients.",
+            len(state.active_node_ids),
+        )
+
+        for msg in msgs:
+            if msg.has_error():
+                state.failures.append(Exception(msg.error))
+                continue
+            key_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+            node_id = msg.metadata.src_node_id
+            pk = cast(bytes, key_dict[Key.PUBLIC_KEY_PAIRWISE])
+            state.nid_to_publickeys[node_id] = pk
+
+        return self._check_threshold(state)
+
+    def share_keys_stage(  # pylint: disable=R0914
+        self, grid: Grid, context: LegacyContext, state: WorkflowState
+    ) -> bool:
+        """Execute the 'share keys' stage (stage 1)."""
+        cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+
+        def make(nid: int) -> Message:
+            neighbours = state.nid_to_neighbours[nid] & state.active_node_ids
+            cfg_record = ConfigRecord(
+                {str(nid): state.nid_to_publickeys[nid] for nid in neighbours}
+            )
+            cfg_record[Key.STAGE] = Stage.SHARE_KEYS
+            content = RecordDict({RECORD_KEY_CONFIGS: cfg_record})
+            return Message(
+                content=content,
+                dst_node_id=nid,
+                message_type=MessageType.TRAIN,
+                group_id=str(cfg[WorkflowKey.CURRENT_ROUND]),
+            )
+
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 1] Forwarding public keys to %s clients.",
+            len(state.active_node_ids),
+        )
+        msgs = grid.send_and_receive(
+            [make(node_id) for node_id in state.active_node_ids], timeout=self.timeout
+        )
+        state.active_node_ids = {
+            msg.metadata.src_node_id for msg in msgs if not msg.has_error()
+        }
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 1] Received encrypted payloads from %s clients.",
+            len(state.active_node_ids),
+        )
+
+        srcs: list[int] = []
+        dsts: list[int] = []
+        ciphertexts: list[bytes] = []
+
+        fwd_ciphertexts: dict[int, list[bytes]] = {
+            nid: [] for nid in state.active_node_ids
+        }
+        fwd_srcs: dict[int, list[int]] = {nid: [] for nid in state.active_node_ids}
+
+        for msg in msgs:
+            if msg.has_error():
+                state.failures.append(Exception(msg.error))
+                continue
+            res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+            dst_lst = cast(list[int], res_dict[Key.DESTINATION_LIST])
+            src_lst = cast(list[int], res_dict[Key.SOURCE_LIST])
+            ctxt_lst = cast(list[bytes], res_dict[Key.CIPHERTEXT_LIST])
+
+            for src, dst, ciphertext in zip(src_lst, dst_lst, ctxt_lst, strict=True):
+                srcs.append(src)
+                dsts.append(dst)
+                ciphertexts.append(ciphertext)
+
+        for src, dst, ciphertext in zip(srcs, dsts, ciphertexts, strict=True):
+            if dst in fwd_ciphertexts:
+                fwd_ciphertexts[dst].append(ciphertext)
+                fwd_srcs[dst].append(src)
+
+        state.forward_srcs = fwd_srcs
+        state.forward_ciphertexts = fwd_ciphertexts
+
+        return self._check_threshold(state)
+
+    def collect_masked_vectors_stage(  # pylint: disable=R0914
+        self, grid: Grid, context: LegacyContext, state: WorkflowState
+    ) -> bool:
+        """Execute the 'collect masked vectors' stage (stage 2)."""
+        cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+
+        def make(nid: int) -> Message:
+            cfg_dict = {
+                Key.STAGE: Stage.COLLECT_MASKED_VECTORS,
+                Key.SOURCE_LIST: state.forward_srcs[nid],
+                Key.CIPHERTEXT_LIST: state.forward_ciphertexts[nid],
+            }
+            cfg_record = ConfigRecord(cfg_dict)  # type: ignore
+            content = state.nid_to_fitins[nid]
+            content.config_records[RECORD_KEY_CONFIGS] = cfg_record
+            return Message(
+                content=content,
+                dst_node_id=nid,
+                message_type=MessageType.TRAIN,
+                group_id=str(cfg[WorkflowKey.CURRENT_ROUND]),
+            )
+
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 2] Forwarding payloads to %s clients.",
+            len(state.active_node_ids),
+        )
+        msgs = grid.send_and_receive(
+            [make(node_id) for node_id in state.active_node_ids], timeout=self.timeout
+        )
+        state.active_node_ids = {
+            msg.metadata.src_node_id for msg in msgs if not msg.has_error()
+        }
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 2] Received masked vectors from %s clients.",
+            len(state.active_node_ids),
+        )
+
+        del state.forward_srcs, state.forward_ciphertexts, state.nid_to_fitins
+
+        aggregate: NDArrays | None = None
+        for msg in msgs:
+            if msg.has_error():
+                state.failures.append(Exception(msg.error))
+                continue
+            res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+            bytes_list = cast(list[bytes], res_dict[Key.MASKED_PARAMETERS])
+            c_s = [bytes_to_ndarray(b) for b in bytes_list]
+            sum_s_bytes = cast(list[bytes], res_dict[Key.SUM_DERIVED_KEYS])
+            sum_s = [bytes_to_ndarray(b) for b in sum_s_bytes]
+
+            state.masked_params[msg.metadata.src_node_id] = c_s
+            state.sum_derived[msg.metadata.src_node_id] = sum_s
+
+            if aggregate is None:
+                aggregate = c_s
+            else:
+                aggregate = parameters_addition(aggregate, c_s)
+
+            # Backward compatibility with Strategy.
+            fitres = compat.recorddict_to_fitres(msg.content, True)
+            proxy = state.nid_to_proxies[msg.metadata.src_node_id]
+            state.legacy_results.append((proxy, fitres))
+
+        if aggregate is None:
+            log(ERROR, "No masked vectors received.")
+            return False
+
+        # Subtract all sum_S vectors.
+        for sum_s in state.sum_derived.values():
+            aggregate = parameters_subtraction(aggregate, sum_s)
+
+        aggregate = parameters_mod(aggregate, state.mod_range)
+        state.aggregate_ndarrays = aggregate
+
+        return self._check_threshold(state)
+
+    def unmask_stage(  # pylint: disable=R0912, R0914, R0915
+        self, grid: Grid, context: LegacyContext, state: WorkflowState
+    ) -> bool:
+        """Execute the 'unmask' stage (stage 3).
+
+        ``stage2_dead`` are sampled clients that never sent a masked vector.
+        Their pairwise masks with surviving clients remain in the aggregate and
+        must be cancelled. Clients that sent a masked vector but dropped before
+        unmask are ``stage3_dead``; their self mask must be reconstructed from
+        shares. For each dropped client we reconstruct the appropriate master
+        seed (``b_seed`` for stage-2 dropouts, ``u_seed`` for stage-3 dropouts)
+        via Shamir, cancel the corresponding masks, and add the surviving
+        clients' ``e_S`` corrections.
+        """
+        cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+        current_round = cast(int, cfg[WorkflowKey.CURRENT_ROUND])
+
+        # Clients that sent masked vectors in stage 2.
+        p2_clients = set(state.masked_params.keys())
+        stage2_dead = state.sampled_node_ids - p2_clients
+
+        def make(nid: int, active: set[int], dead: set[int]) -> Message:
+            neighbours = state.nid_to_neighbours[nid]
+            cfg_dict = {
+                Key.STAGE: Stage.UNMASK,
+                Key.ACTIVE_NODE_ID_LIST: list(neighbours & active),
+                Key.DEAD_NODE_ID_LIST: list(neighbours & dead),
+            }
+            cfg_record = ConfigRecord(cfg_dict)  # type: ignore
+            content = RecordDict({RECORD_KEY_CONFIGS: cfg_record})
+            return Message(
+                content=content,
+                dst_node_id=nid,
+                message_type=MessageType.TRAIN,
+                group_id=str(current_round),
+            )
+
+        # Round 1: ask every client that reached stage 2 for its self mask,
+        # its e_S correction for stage-2 dead neighbours, and b_seed shares for
+        # stage-2 dead neighbours.
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 3] Requesting shares from %s clients.",
+            len(state.active_node_ids),
+        )
+        msgs = grid.send_and_receive(
+            [
+                make(node_id, p2_clients, stage2_dead)
+                for node_id in state.active_node_ids
+            ],
+            timeout=self.timeout,
+        )
+        responding_nids = {
+            msg.metadata.src_node_id for msg in msgs if not msg.has_error()
+        }
+        log(
+            DEBUG,
+            "[SecAggPlusPlus Stage 3] Received shares from %s clients.",
+            len(responding_nids),
+        )
+
+        # Clients that survived through the first unmask round.
+        p3_clients = responding_nids
+        stage3_dead = p2_clients - p3_clients
+
+        b_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in stage2_dead}
+        u_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in stage3_dead}
+        self_masks: dict[int, bytes] = {}
+
+        for msg in msgs:
+            if msg.has_error():
+                state.failures.append(Exception(msg.error))
+                continue
+            res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+            dead_lst = cast(list[int], res_dict[Key.NODE_ID_LIST])
+            share_lst = cast(list[bytes], res_dict[Key.SHARE_LIST])
+            self_mask = cast(bytes, res_dict[Key.SELF_MASK])
+
+            self_masks[msg.metadata.src_node_id] = self_mask
+
+            for idx, dead_nid in enumerate(dead_lst):
+                if dead_nid in stage2_dead:
+                    b_seed_shares[dead_nid].append(share_lst[idx])
+
+        # Round 2 (only needed for stage-3 dropouts): ask the surviving clients
+        # for the u_seed shares of clients that sent c_S but did not respond in
+        # round 1.
+        if stage3_dead:
+            log(
+                DEBUG,
+                "[SecAggPlusPlus Stage 3b] Requesting u_seed shares for %s stage-3 "
+                "dropouts from %s clients.",
+                len(stage3_dead),
+                len(p3_clients),
+            )
+            msgs2 = grid.send_and_receive(
+                [make(node_id, p3_clients, stage3_dead) for node_id in p3_clients],
+                timeout=self.timeout,
+            )
+            responding2 = {
+                msg.metadata.src_node_id for msg in msgs2 if not msg.has_error()
+            }
+            log(
+                DEBUG,
+                "[SecAggPlusPlus Stage 3b] Received u_seed shares from %s clients.",
+                len(responding2),
+            )
+            for msg in msgs2:
+                if msg.has_error():
+                    state.failures.append(Exception(msg.error))
+                    continue
+                res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+                dead_lst = cast(list[int], res_dict[Key.NODE_ID_LIST])
+                share_lst = cast(list[bytes], res_dict[Key.SHARE_LIST])
+                for idx, dead_nid in enumerate(dead_lst):
+                    if dead_nid in stage3_dead:
+                        u_seed_shares[dead_nid].append(share_lst[idx])
+
+        masked_vector = state.aggregate_ndarrays
+        del state.aggregate_ndarrays
+        dimensions_list = get_parameters_shape(masked_vector)
+
+        # Masks apply only to the parameter arrays, not to the leading
+        # quantization factor.
+        factor = [masked_vector[0]]
+        params = masked_vector[1:]
+        param_dimensions = dimensions_list[1:]
+
+        # Cancel outgoing masks from each stage-2 dropped client to surviving
+        # clients.
+        for dead_nid in stage2_dead:
+            share_list = b_seed_shares[dead_nid]
+            if len(share_list) < state.threshold:
+                log(
+                    ERROR,
+                    "Not enough shares to recover b_seed for client %d",
+                    dead_nid,
+                )
+                return False
+            b_seed = combine_shares(share_list)
+
+            for survivor_nid in state.nid_to_neighbours[dead_nid] & p2_clients:
+                k = derive_pairwise_key(b_seed, survivor_nid)
+                mask = pseudo_rand_gen(k, state.mod_range, param_dimensions)
+                params = parameters_subtraction(params, mask)
+
+        # Cancel incoming masks from surviving clients to stage-2 dropped
+        # clients. Each surviving client sends e_S as a vector sum.
+        for msg in msgs:
+            if msg.has_error():
+                continue
+            res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
+            e_lst = cast(list[bytes], res_dict[Key.E_VALUE])
+            e_sum = [bytes_to_ndarray(b) for b in e_lst]
+            params = parameters_addition(params, e_sum)
+
+        params = parameters_mod(params, state.mod_range)
+
+        # Remove self masks for all clients whose c_S is in the aggregate.
+        for nid in p2_clients:
+            if nid in p3_clients:
+                if nid not in self_masks:
+                    log(ERROR, "Missing self mask from client %d", nid)
+                    return False
+                u_seed = self_masks[nid]
+            else:
+                share_list = u_seed_shares[nid]
+                if len(share_list) < state.threshold:
+                    log(
+                        ERROR,
+                        "Not enough shares to recover u_seed for client %d",
+                        nid,
+                    )
+                    return False
+                u_seed = combine_shares(share_list)
+            u_mask = pseudo_rand_gen(u_seed, state.mod_range, param_dimensions)
+            params = parameters_subtraction(params, u_mask)
+
+        masked_vector = [factor[0]] + parameters_mod(params, state.mod_range)
+
+        recon_parameters = parameters_mod(masked_vector, state.mod_range)
+        q_total_ratio, recon_parameters = factor_extract(recon_parameters)
+        inv_dq_total_ratio = state.quantization_range / q_total_ratio
+        aggregated_vector = dequantize(
+            recon_parameters,
+            state.clipping_range,
+            state.quantization_range,
+        )
+        offset = -(len(state.masked_params) - 1) * state.clipping_range
+        for vec in aggregated_vector:
+            vec += offset
+            vec *= inv_dq_total_ratio
+
+        # Backward compatibility with Strategy.
+        results = state.legacy_results
+        parameters = ndarrays_to_parameters(aggregated_vector)
+        for _, fitres in results:
+            fitres.parameters = parameters
+
+        log(
+            INFO,
+            "aggregate_fit: received %s results and %s failures",
+            len(results),
+            len(state.failures),
+        )
+        aggregated_result = context.strategy.aggregate_fit(
+            current_round, results, state.failures  # type: ignore
+        )
+        parameters_aggregated, metrics_aggregated = aggregated_result
+
+        if parameters_aggregated:
+            arr_record = compat.parameters_to_arrayrecord(parameters_aggregated, True)
+            context.state.array_records[MAIN_PARAMS_RECORD] = arr_record
+            context.history.add_metrics_distributed_fit(
+                server_round=current_round, metrics=metrics_aggregated
+            )
+        return True

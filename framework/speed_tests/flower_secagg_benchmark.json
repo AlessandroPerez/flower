@@ -5,7 +5,16 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.45831241899941233,
+    "time_seconds": 0.6542216270008794,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 10,
+    "target_dropout_rate": 0.0,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 0.6408468369991169,
     "status": "success"
   },
   {
@@ -14,7 +23,7 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.19720802499978163,
+    "time_seconds": 0.21101008100049512,
     "status": "success"
   },
   {
@@ -23,7 +32,16 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.43325291899964213,
+    "time_seconds": 0.6026726549989689,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 10,
+    "target_dropout_rate": 0.01,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 0.5899463850000757,
     "status": "success"
   },
   {
@@ -32,7 +50,7 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.1397717380004906,
+    "time_seconds": 0.2197729720010102,
     "status": "success"
   },
   {
@@ -41,7 +59,16 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.4804639150006551,
+    "time_seconds": 0.5973567689998163,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 10,
+    "target_dropout_rate": 0.05,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 0.5976320819991088,
     "status": "success"
   },
   {
@@ -50,7 +77,7 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.14122516199859092,
+    "time_seconds": 0.2096262300001399,
     "status": "success"
   },
   {
@@ -59,7 +86,16 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 1,
-    "time_seconds": 0.7014854659992125,
+    "time_seconds": 0.7461692569995648,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 10,
+    "target_dropout_rate": 0.1,
+    "actual_dropout_rate": 0.1,
+    "dropped": 1,
+    "time_seconds": 0.6666644039996754,
     "status": "success"
   },
   {
@@ -68,7 +104,7 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 1,
-    "time_seconds": 0.17326802800016594,
+    "time_seconds": 0.24899639199975354,
     "status": "success"
   },
   {
@@ -77,7 +113,16 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 1.0366567190012574,
+    "time_seconds": 1.2118480959998124,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 20,
+    "target_dropout_rate": 0.0,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 1.2066121650004789,
     "status": "success"
   },
   {
@@ -86,7 +131,7 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.3031599070000084,
+    "time_seconds": 0.4064663440003642,
     "status": "success"
   },
   {
@@ -95,7 +140,16 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.9670488080009818,
+    "time_seconds": 1.2020645539996622,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 20,
+    "target_dropout_rate": 0.01,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 1.2108312560012564,
     "status": "success"
   },
   {
@@ -104,7 +158,7 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.26834942499954195,
+    "time_seconds": 0.39525838600093266,
     "status": "success"
   },
   {
@@ -113,7 +167,16 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.05,
     "dropped": 1,
-    "time_seconds": 1.711321193999538,
+    "time_seconds": 1.9477453970011993,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 20,
+    "target_dropout_rate": 0.05,
+    "actual_dropout_rate": 0.05,
+    "dropped": 1,
+    "time_seconds": 2.26579422299983,
     "status": "success"
   },
   {
@@ -122,7 +185,7 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.05,
     "dropped": 1,
-    "time_seconds": 0.3982871789994533,
+    "time_seconds": 0.5874213529987173,
     "status": "success"
   },
   {
@@ -131,7 +194,16 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 2,
-    "time_seconds": 2.5759597409996786,
+    "time_seconds": 2.669901387000209,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 20,
+    "target_dropout_rate": 0.1,
+    "actual_dropout_rate": 0.1,
+    "dropped": 2,
+    "time_seconds": 3.539738371000567,
     "status": "success"
   },
   {
@@ -140,7 +212,7 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 2,
-    "time_seconds": 0.5590285200014478,
+    "time_seconds": 0.8381770449996111,
     "status": "success"
   },
   {
@@ -149,7 +221,16 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 2.299668183999529,
+    "time_seconds": 3.0969716330000665,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 50,
+    "target_dropout_rate": 0.0,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 3.110043738999593,
     "status": "success"
   },
   {
@@ -158,7 +239,7 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.7294264930005738,
+    "time_seconds": 0.9961664469992684,
     "status": "success"
   },
   {
@@ -167,7 +248,16 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 2.3588803490001737,
+    "time_seconds": 3.2904163950006478,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 50,
+    "target_dropout_rate": 0.01,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 3.2398796569996193,
     "status": "success"
   },
   {
@@ -176,7 +266,7 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 0.6667557430009765,
+    "time_seconds": 1.0447145640009694,
     "status": "success"
   },
   {
@@ -185,7 +275,16 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.04,
     "dropped": 2,
-    "time_seconds": 4.152920659998927,
+    "time_seconds": 4.403100888001063,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 50,
+    "target_dropout_rate": 0.05,
+    "actual_dropout_rate": 0.04,
+    "dropped": 2,
+    "time_seconds": 5.018303157001355,
     "status": "success"
   },
   {
@@ -194,7 +293,7 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.04,
     "dropped": 2,
-    "time_seconds": 0.9621847979997256,
+    "time_seconds": 1.3262734009986161,
     "status": "success"
   },
   {
@@ -203,7 +302,16 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 5,
-    "time_seconds": 7.739427656000771,
+    "time_seconds": 7.337047356000767,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 50,
+    "target_dropout_rate": 0.1,
+    "actual_dropout_rate": 0.1,
+    "dropped": 5,
+    "time_seconds": 10.41370952500074,
     "status": "success"
   },
   {
@@ -212,7 +320,7 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 5,
-    "time_seconds": 1.5728564450000704,
+    "time_seconds": 2.210472488999585,
     "status": "success"
   },
   {
@@ -221,7 +329,16 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 6.438177071999235,
+    "time_seconds": 7.741509678999137,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 100,
+    "target_dropout_rate": 0.0,
+    "actual_dropout_rate": 0.0,
+    "dropped": 0,
+    "time_seconds": 8.374508146000153,
     "status": "success"
   },
   {
@@ -230,7 +347,7 @@
     "target_dropout_rate": 0.0,
     "actual_dropout_rate": 0.0,
     "dropped": 0,
-    "time_seconds": 1.6504915350014926,
+    "time_seconds": 2.298623359998601,
     "status": "success"
   },
   {
@@ -239,7 +356,16 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.01,
     "dropped": 1,
-    "time_seconds": 6.5551087300009385,
+    "time_seconds": 7.902805001000161,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 100,
+    "target_dropout_rate": 0.01,
+    "actual_dropout_rate": 0.01,
+    "dropped": 1,
+    "time_seconds": 8.593735526001183,
     "status": "success"
   },
   {
@@ -248,7 +374,7 @@
     "target_dropout_rate": 0.01,
     "actual_dropout_rate": 0.01,
     "dropped": 1,
-    "time_seconds": 1.6712137800004712,
+    "time_seconds": 2.447671559999435,
     "status": "success"
   },
   {
@@ -257,7 +383,16 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.05,
     "dropped": 5,
-    "time_seconds": 9.941566154000611,
+    "time_seconds": 11.074901844998749,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 100,
+    "target_dropout_rate": 0.05,
+    "actual_dropout_rate": 0.05,
+    "dropped": 5,
+    "time_seconds": 12.433719745000417,
     "status": "success"
   },
   {
@@ -266,7 +401,7 @@
     "target_dropout_rate": 0.05,
     "actual_dropout_rate": 0.05,
     "dropped": 5,
-    "time_seconds": 2.2415941290000774,
+    "time_seconds": 3.113560977000816,
     "status": "success"
   },
   {
@@ -275,7 +410,16 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 10,
-    "time_seconds": 14.04576923499917,
+    "time_seconds": 13.773441412999091,
+    "status": "success"
+  },
+  {
+    "impl": "pq_single",
+    "n": 100,
+    "target_dropout_rate": 0.1,
+    "actual_dropout_rate": 0.1,
+    "dropped": 10,
+    "time_seconds": 18.36573805899934,
     "status": "success"
   },
   {
@@ -284,7 +428,7 @@
     "target_dropout_rate": 0.1,
     "actual_dropout_rate": 0.1,
     "dropped": 10,
-    "time_seconds": 3.0266282909997244,
+    "time_seconds": 4.286213179999322,
     "status": "success"
   }
 ]

@@ -160,3 +160,58 @@ def pseudo_rand_gen(
             arr = gen.randint(0, num_range - 1, dimension, dtype=np.int64)
         output.append(arr)
     return output
+
+
+def derive_pairwise_key(seed: bytes, n_id: int) -> bytes:
+    """Derive a pairwise key from a master seed and a neighbour node ID.
+
+    The derivation matches the SecAggPlusPlus design:
+    ``Hash(seed || encoding(n_id))`` where ``encoding(n_id)`` is the 32-byte
+    little-endian representation of the node ID.
+    """
+    import hashlib
+
+    return hashlib.sha256(seed + int.to_bytes(n_id, 32, "little")).digest()
+
+
+def share_keys_plaintext_concat_plus(
+    src_node_id: int,
+    dst_node_id: int,
+    pairwise_key: bytes,
+    b_seed_share: bytes,
+    self_mask_share: bytes,
+) -> bytes:
+    """Combine a SecAggPlusPlus payload into bytes."""
+    return b"".join(
+        [
+            int.to_bytes(src_node_id, 8, "little", signed=False),
+            int.to_bytes(dst_node_id, 8, "little", signed=False),
+            int.to_bytes(len(pairwise_key), 4, "little"),
+            pairwise_key,
+            int.to_bytes(len(b_seed_share), 4, "little"),
+            b_seed_share,
+            int.to_bytes(len(self_mask_share), 4, "little"),
+            self_mask_share,
+        ]
+    )
+
+
+def share_keys_plaintext_separate_plus(
+    plaintext: bytes,
+) -> tuple[int, int, bytes, bytes, bytes]:
+    """Retrieve src, dst, pairwise key, b-seed share, and self-mask share."""
+    src = int.from_bytes(plaintext[:8], "little", signed=False)
+    dst = int.from_bytes(plaintext[8:16], "little", signed=False)
+    offset = 16
+    length = int.from_bytes(plaintext[offset : offset + 4], "little")
+    offset += 4
+    pairwise_key = plaintext[offset : offset + length]
+    offset += length
+    length = int.from_bytes(plaintext[offset : offset + 4], "little")
+    offset += 4
+    b_seed_share = plaintext[offset : offset + length]
+    offset += length
+    length = int.from_bytes(plaintext[offset : offset + 4], "little")
+    offset += 4
+    self_mask_share = plaintext[offset : offset + length]
+    return src, dst, pairwise_key, b_seed_share, self_mask_share

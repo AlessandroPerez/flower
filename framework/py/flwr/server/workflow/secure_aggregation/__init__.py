@@ -16,9 +16,11 @@
 
 
 from .secagg_workflow import SecAggWorkflow
+from .secaggplus_plus_workflow import SecAggPlusPlusWorkflow
 from .secaggplus_workflow import SecAggPlusWorkflow
 
 __all__ = [
+    "SecAggPlusPlusWorkflow",
     "SecAggPlusWorkflow",
     "SecAggWorkflow",
 ]

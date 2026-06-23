@@ -4,8 +4,7 @@ This script runs one training round of Flower's SecAgg+ protocol in-process.
 It compares:
 
 - classical SecAgg+ (``SecAggPlusWorkflow`` + ``secaggplus_mod``)
-- single-KEM PQ SecAgg+ (``SecAggPlusPQWorkflow(..., single_kem=True)`` +
-  ``secaggplus_pq_mod``)
+- SecAgg++ (``SecAggPlusPlusWorkflow`` + ``secaggplus_plus_mod``)
 
 For each (number of clients, dropout rate) configuration it records the wall
 clock time of the full federated round and writes the results as JSON.
@@ -27,7 +26,9 @@ from flwr.app import Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.client.mod import make_ffn
 from flwr.client.mod.secure_aggregation.secaggplus_mod import secaggplus_mod
-from flwr.client.mod.secure_aggregation.secaggplus_pq_mod import secaggplus_pq_mod
+from flwr.client.mod.secure_aggregation.secaggplus_plus_mod import (
+    secaggplus_plus_mod,
+)
 from flwr.common import (
     Code,
     FitRes,
@@ -51,8 +52,8 @@ from flwr.server.compat.legacy_context import LegacyContext
 from flwr.server.server_config import ServerConfig
 from flwr.server.strategy import FedAvg
 from flwr.server.workflow import DefaultWorkflow
-from flwr.server.workflow.secure_aggregation.secaggplus_pq_workflow import (
-    SecAggPlusPQWorkflow,
+from flwr.server.workflow.secure_aggregation.secaggplus_plus_workflow import (
+    SecAggPlusPlusWorkflow,
 )
 from flwr.server.workflow.secure_aggregation.secaggplus_workflow import (
     SecAggPlusWorkflow,
@@ -98,11 +99,13 @@ class InMemoryGrid(Grid):
         apps: dict[int, Callable[[Message, Context], Message]],
         contexts: dict[int, Context],
         dropped: set[int],
+        impl: str = "classical",
     ) -> None:
         self._run = Run.create_empty(run_id)
         self._apps = apps
         self._contexts = contexts
         self._dropped = set(dropped)
+        self._impl = impl
         self._closed = False
         self._replies: dict[str, Message] = {}
 
@@ -161,6 +164,22 @@ class InMemoryGrid(Grid):
             return False
         return cfg.get(SecAggKey.STAGE) == SecAggStage.UNMASK
 
+    def _is_collect_masked_vectors_message(self, msg: Message) -> bool:
+        """Return True if the message is the SecAgg masked-vector stage."""
+        cfg = msg.content.config_records.get(SECAGG_RECORD_KEY_CONFIGS)
+        if cfg is None:
+            return False
+        return cfg.get(SecAggKey.STAGE) == SecAggStage.COLLECT_MASKED_VECTORS
+
+    def _should_drop(self, msg: Message) -> bool:
+        """Return True if a message to a dropped client should be dropped.
+
+        We drop the masked-vector collection message so that both
+        implementations experience the same stage-2 dropout pattern: the client
+        never contributes an update to the aggregate.
+        """
+        return self._is_collect_masked_vectors_message(msg)
+
     def push_messages(self, messages: Iterable[Message]) -> Iterable[str]:
         """Push messages to local clients and return their message IDs."""
         ids: list[str] = []
@@ -168,7 +187,7 @@ class InMemoryGrid(Grid):
             mid = str(uuid.uuid4())
             ids.append(mid)
             dst = msg.metadata.dst_node_id
-            if dst in self._dropped and self._is_unmask_message(msg):
+            if dst in self._dropped and self._should_drop(msg):
                 continue
             self._replies[mid] = self._apps[dst](
                 self._copy_message(msg), self._contexts[dst]
@@ -195,7 +214,7 @@ class InMemoryGrid(Grid):
         replies: list[Message] = []
         for msg in messages:
             dst = msg.metadata.dst_node_id
-            if dst in self._dropped and self._is_unmask_message(msg):
+            if dst in self._dropped and self._should_drop(msg):
                 continue
             replies.append(
                 self._apps[dst](self._copy_message(msg), self._contexts[dst])
@@ -337,9 +356,8 @@ def _make_workflow(
             quantization_range=2**20,
             modulus_range=2**30,
         )
-    if impl == "pq_single":
-        return SecAggPlusPQWorkflow(
-            single_kem=True,
+    if impl == "secaggplusplus":
+        return SecAggPlusPlusWorkflow(
             num_shares=k,
             reconstruction_threshold=t,
             gamma=GAMMA,
@@ -359,8 +377,8 @@ def _make_client_modifier(
 ) -> Callable[[Message, Context, Callable[..., Message]], Message]:
     if impl == "classical":
         return secaggplus_mod
-    if impl == "pq_single":
-        return secaggplus_pq_mod
+    if impl == "secaggplusplus":
+        return secaggplus_plus_mod
     raise ValueError(f"Unknown implementation: {impl}")
 
 
@@ -371,7 +389,9 @@ def _run_one(
     node_ids = list(range(n))
     modifier = _make_client_modifier(impl)
     apps, contexts = _build_client_apps(node_ids, modifier)
-    grid = InMemoryGrid(run_id=1, apps=apps, contexts=contexts, dropped=dropped)
+    grid = InMemoryGrid(
+        run_id=1, apps=apps, contexts=contexts, dropped=dropped, impl=impl
+    )
 
     initial_params = Parameters(
         tensors=[ndarray_to_bytes(np.zeros(NUM_FEATURES, dtype=np.float64))],
@@ -427,12 +447,13 @@ def main() -> None:
     """Run the benchmark sweep and save JSON results."""
     client_counts = _log_counts(MAX_CLIENTS)
     results: list[dict[str, Any]] = []
-    total = len(client_counts) * len(DROPOUT_RATES) * RUNS_PER_CONFIG * 2
+    impls = ["classical", "secaggplusplus"]
+    total = len(client_counts) * len(DROPOUT_RATES) * RUNS_PER_CONFIG * len(impls)
     done = 0
 
     print(
         f"Sweep: clients={client_counts}, dropout_rates={DROPOUT_RATES}, "
-        f"runs={RUNS_PER_CONFIG}, impls=['classical','pq_single']",
+        f"runs={RUNS_PER_CONFIG}, impls={impls}",
         flush=True,
     )
 
@@ -440,7 +461,7 @@ def main() -> None:
         for rate in DROPOUT_RATES:
             for run in range(RUNS_PER_CONFIG):
                 dropped = _choose_dropped(n, rate, run)
-                for impl in ("classical", "pq_single"):
+                for impl in impls:
                     done += 1
                     print(
                         f"[{done}/{total}] impl={impl} n={n} dropout={rate:.0%} "
