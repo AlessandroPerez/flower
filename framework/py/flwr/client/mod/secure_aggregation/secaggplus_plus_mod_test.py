@@ -143,7 +143,8 @@ class TestSecAggPlusPlusMod:
         aggregate = parameters_subtraction(aggregate, sum_s)
         aggregate = parameters_mod(aggregate, 1024)
 
-        # Unmask: both clients are alive, so only self masks are removed.
+        # Unmask: collect u_seed shares for all active clients and reconstruct
+        # every self mask from threshold shares.
         unmask_cfg1 = ConfigRecord(
             {
                 Key.STAGE: Stage.UNMASK,
@@ -161,19 +162,20 @@ class TestSecAggPlusPlusMod:
         u_res1 = _unmask(state1, unmask_cfg1)
         u_res2 = _unmask(state2, unmask_cfg2)
 
-        self_mask1 = cast(bytes, u_res1[Key.SELF_MASK])
-        self_mask2 = cast(bytes, u_res2[Key.SELF_MASK])
-
-        from flwr.common.secure_aggregation.secaggplus_utils import pseudo_rand_gen
+        u_seed_shares: dict[int, list[bytes]] = {1: [], 2: []}
+        for res in (u_res1, u_res2):
+            nids = cast(list[int], res[Key.NODE_ID_LIST])
+            shares = cast(list[bytes], res[Key.SHARE_LIST])
+            for nid, share in zip(nids, shares, strict=True):
+                u_seed_shares[nid].append(share)
 
         dims: list[tuple[int, ...]] = [(2,)]
         params_aggregate = [aggregate[1]]
-        params_aggregate = parameters_subtraction(
-            params_aggregate, pseudo_rand_gen(self_mask1, 1024, dims)
-        )
-        params_aggregate = parameters_subtraction(
-            params_aggregate, pseudo_rand_gen(self_mask2, 1024, dims)
-        )
+        for nid in (1, 2):
+            u_seed = combine_shares(u_seed_shares[nid])
+            params_aggregate = parameters_subtraction(
+                params_aggregate, pseudo_rand_gen(u_seed, 1024, dims)
+            )
         params_aggregate = parameters_mod(params_aggregate, 1024)
         aggregate[1] = params_aggregate[0]
 
@@ -186,8 +188,8 @@ class TestSecAggPlusPlusMod:
     def test_stage3_dropout_end_to_end(self) -> None:
         """Three clients aggregate; one drops after sending its masked vector.
 
-        The server reconstructs the dropped client's self mask from the shares
-        held by the two surviving clients.
+        The server reconstructs every self mask from threshold shares, including
+        the dropped client's.
         """
         # Setup three clients in an all-to-all neighbour graph.
         states = {nid: _make_state(nid) for nid in (1, 2, 3)}
@@ -270,30 +272,32 @@ class TestSecAggPlusPlusMod:
         aggregate = parameters_subtraction(aggregate, sum_derived)
         aggregate = parameters_mod(aggregate, 1024)
 
-        # Client 3 drops before unmask. Clients 1 and 2 respond.
-        u_seed_shares: list[bytes] = []
+        # Client 3 drops before unmask, but is still in the active list sent to
+        # clients 1 and 2. They return u_seed shares for all active clients.
+        u_seed_shares: dict[int, list[bytes]] = {1: [], 2: [], 3: []}
         for survivor_nid in (1, 2):
             unmask_cfg = ConfigRecord(
                 {
                     Key.STAGE: Stage.UNMASK,
-                    Key.ACTIVE_NODE_ID_LIST: [1, 2],
-                    Key.DEAD_NODE_ID_LIST: [3],
+                    Key.ACTIVE_NODE_ID_LIST: [1, 2, 3],
+                    Key.DEAD_NODE_ID_LIST: [],
                 }
             )
             res = _unmask(states[survivor_nid], unmask_cfg)
-            assert cast(list[int], res[Key.NODE_ID_LIST]) == [3]
-            u_seed_shares.append(cast(list[bytes], res[Key.SHARE_LIST])[0])
-            self_mask = cast(bytes, res[Key.SELF_MASK])
-            dims: list[tuple[int, ...]] = [(2,)]
-            aggregate[1] = parameters_subtraction(
-                [aggregate[1]], pseudo_rand_gen(self_mask, 1024, dims)
-            )[0]
+            nids = cast(list[int], res[Key.NODE_ID_LIST])
+            shares = cast(list[bytes], res[Key.SHARE_LIST])
+            for nid, share in zip(nids, shares, strict=True):
+                u_seed_shares[nid].append(share)
 
-        # Reconstruct client 3's self mask and remove it.
-        u_seed3 = combine_shares(u_seed_shares)
-        aggregate[1] = parameters_subtraction(
-            [aggregate[1]], pseudo_rand_gen(u_seed3, 1024, [(2,)])
-        )[0]
+        # Reconstruct every self mask and remove it.
+        dims: list[tuple[int, ...]] = [(2,)]
+        params_aggregate = [aggregate[1]]
+        for nid in (1, 2, 3):
+            u_seed = combine_shares(u_seed_shares[nid])
+            params_aggregate = parameters_subtraction(
+                params_aggregate, pseudo_rand_gen(u_seed, 1024, dims)
+            )
+        aggregate[1] = parameters_mod(params_aggregate, 1024)[0]
         aggregate = parameters_mod(aggregate, 1024)
 
         # Expected quantized sum: [1,2]->[6,7], [3,-1]->[8,4], [0,1]->[5,6].
@@ -302,25 +306,29 @@ class TestSecAggPlusPlusMod:
         np.testing.assert_array_equal(aggregate[1], expected[1])
 
     def test_unmask_partitions_stage2_and_stage3_dropouts(self) -> None:
-        """_unmask returns b_seed shares for stage-2 dead and u_seed shares for
-        stage-3 dead, plus the e_S correction for stage-2 dead only.
+        """_unmask returns u_seed shares for active clients (including stage-3
+        dropouts) and b_seed shares for stage-2 dead clients, plus the e_S
+        correction for stage-2 dead only.
         """
         state = _make_state(1)
         state.mod_range = 1024
         state.dimensions_list = [(2,)]
-        state.u_seed = b"self-seed"
         state.received_keys = {}
         state.received_b_shares = {}
         state.received_u_shares = {}
+        state.u_seed_shares = {}
         state.derived_keys = {}
 
-        # Client 2 is a stage-3 dropout: we received its pairwise key but it
-        # will not respond to unmask.
+        # Client 1 is ourselves: store our own u_seed share.
+        state.u_seed_shares[1] = b"u-share-self"
+
+        # Client 2 is a stage-3 dropout: it is in the active list and we have a
+        # u_seed share for it.
         state.received_keys[2] = b"key-2"
         state.received_u_shares[2] = b"u-share-2"
 
-        # Client 3 is a stage-2 dropout: it never reached masked-vector
-        # collection, so we only have a derived outgoing key and a b_seed share.
+        # Client 3 is a stage-2 dropout: it is in the dead list and we have a
+        # b_seed share for it.
         state.derived_keys[3] = b"\x01" * 32
         state.received_b_shares[3] = b"b-share-3"
 
@@ -328,19 +336,20 @@ class TestSecAggPlusPlusMod:
             {
                 Key.STAGE: Stage.UNMASK,
                 Key.ACTIVE_NODE_ID_LIST: [1, 2],
-                Key.DEAD_NODE_ID_LIST: [2, 3],
+                Key.DEAD_NODE_ID_LIST: [3],
             }
         )
         res = _unmask(state, configs)
 
-        # The returned dead list is ordered stage-2 first, then stage-3.
-        assert cast(list[int], res[Key.NODE_ID_LIST]) == [3, 2]
-        assert cast(list[bytes], res[Key.SHARE_LIST]) == [b"b-share-3", b"u-share-2"]
-        assert cast(bytes, res[Key.SELF_MASK]) == b"self-seed"
+        # Active clients first, then stage-2 dead clients.
+        assert cast(list[int], res[Key.NODE_ID_LIST]) == [1, 2, 3]
+        assert cast(list[bytes], res[Key.SHARE_LIST]) == [
+            b"u-share-self",
+            b"u-share-2",
+            b"b-share-3",
+        ]
 
         # e_S should contain the mask derived for the stage-2 dropout only.
-        from flwr.common.secure_aggregation.secaggplus_utils import pseudo_rand_gen
-
         e_s = [bytes_to_ndarray(b) for b in cast(list[bytes], res[Key.E_VALUE])]
         expected_e = pseudo_rand_gen(b"\x01" * 32, 1024, [(2,)])
         np.testing.assert_array_equal(e_s[0], expected_e[0])

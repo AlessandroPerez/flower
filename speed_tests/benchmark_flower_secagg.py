@@ -67,7 +67,7 @@ from flwr.supercore.run import Run, RunNotRunningException
 MAX_CLIENTS: int = 100
 DROPOUT_RATES: list[float] = [0.0, 0.01, 0.05, 0.1]
 RUNS_PER_CONFIG: int = 1
-NUM_FEATURES: int = 10
+NUM_FEATURES: int = 100_000
 NUM_EXAMPLES_PER_CLIENT: int = 100
 LEARNING_RATE: float = 0.01
 
@@ -77,8 +77,8 @@ DELTA: float = 0.01
 SIGMA: int = 20
 ETA: int = 20
 
-# Output directory (relative to the current working directory).
-OUT_DIR = Path("speed_tests")
+# Output directory (relative to this script).
+OUT_DIR = Path(__file__).resolve().parent
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 JSON_PATH = OUT_DIR / "flower_secagg_benchmark.json"
 

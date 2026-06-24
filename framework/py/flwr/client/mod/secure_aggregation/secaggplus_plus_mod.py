@@ -474,28 +474,31 @@ def _unmask(
     if len(active_nids) < state.threshold:
         raise ValueError("Available neighbours number smaller than threshold")
 
-    # Partition dead neighbours into stage-2 dropouts (never sent c_S) and
-    # stage-3 dropouts (sent c_S but did not respond to unmask).  The client
-    # knows the difference because it only received a stage-1 payload from
-    # clients that made it to stage 2.
-    stage2_dead = [nid for nid in dead_nids if nid not in state.received_keys]
-    stage3_dead = [nid for nid in dead_nids if nid in state.received_keys]
+    # The server knows which clients sent a masked vector (active_nids) and
+    # which dropped before that stage (dead_nids).  The client trusts these
+    # lists: active clients need u_seed shares, dead clients need b_seed shares.
 
-    # Upload the appropriate share for each dead neighbour:
-    # - b_seed share for stage-2 dropouts (so the server can reconstruct b_D).
-    # - u_seed share for stage-3 dropouts (so the server can reconstruct u_D).
-    all_dead = stage2_dead + stage3_dead
+    # Build the ordered list of clients whose shares we upload:
+    # - active clients first (u_seed shares, so the server can reconstruct
+    #   every self mask from threshold shares rather than receiving it directly)
+    # - dead clients second (b_seed shares, for pairwise-mask recovery)
+    share_nids = active_nids + dead_nids
     shares: list[bytes] = []
-    for nid in all_dead:
-        if nid in stage2_dead:
-            shares.append(state.received_b_shares[nid])
+    for nid in share_nids:
+        if nid in active_nids:
+            # Our own u_seed share is stored in u_seed_shares; shares for other
+            # active clients were received during masked-vector collection.
+            if nid == state.nid:
+                shares.append(state.u_seed_shares[nid])
+            else:
+                shares.append(state.received_u_shares[nid])
         else:
-            shares.append(state.received_u_shares[nid])
+            shares.append(state.received_b_shares[nid])
 
-    # Compute e_S = sum of masks derived by this client for stage-2 dead
-    # neighbours.  These cancel the -k_{S->D} terms that remain in sum_S.
+    # Compute e_S = sum of masks derived by this client for dead neighbours.
+    # These cancel the -k_{S->D} terms that remain in sum_S.
     e_s: NDArrays = [np.zeros(shape, dtype=np.int64) for shape in state.dimensions_list]
-    for nid in stage2_dead:
+    for nid in dead_nids:
         if nid in state.derived_keys:
             mask = pseudo_rand_gen(
                 state.derived_keys[nid], state.mod_range, state.dimensions_list
@@ -505,8 +508,7 @@ def _unmask(
 
     log(DEBUG, "Node %d: SecAggPlusPlus stage 3 completes.", state.nid)
     return {
-        Key.NODE_ID_LIST: all_dead,
+        Key.NODE_ID_LIST: share_nids,
         Key.SHARE_LIST: shares,
         Key.E_VALUE: [ndarray_to_bytes(arr) for arr in e_s],
-        Key.SELF_MASK: state.u_seed,
     }

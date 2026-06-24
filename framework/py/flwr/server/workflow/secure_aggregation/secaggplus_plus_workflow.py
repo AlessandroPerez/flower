@@ -498,10 +498,10 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
         Their pairwise masks with surviving clients remain in the aggregate and
         must be cancelled. Clients that sent a masked vector but dropped before
         unmask are ``stage3_dead``; their self mask must be reconstructed from
-        shares. For each dropped client we reconstruct the appropriate master
-        seed (``b_seed`` for stage-2 dropouts, ``u_seed`` for stage-3 dropouts)
-        via Shamir, cancel the corresponding masks, and add the surviving
-        clients' ``e_S`` corrections.
+        shares. Every self mask (active or stage-3 dropped) is reconstructed
+        via Shamir from u_seed shares, matching the privacy model of classical
+        SecAgg+. The server cancels the pairwise masks for stage-2 dropouts and
+        adds the surviving clients' ``e_S`` corrections.
         """
         cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
         current_round = cast(int, cfg[WorkflowKey.CURRENT_ROUND])
@@ -526,8 +526,9 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
                 group_id=str(current_round),
             )
 
-        # Round 1: ask every client that reached stage 2 for its self mask,
-        # its e_S correction for stage-2 dead neighbours, and b_seed shares for
+        # Ask every client that reached stage 2 for u_seed shares of all active
+        # clients (so every self mask is reconstructed from threshold shares),
+        # b_seed shares for stage-2 dead clients, and the e_S correction for
         # stage-2 dead neighbours.
         log(
             DEBUG,
@@ -550,62 +551,32 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
             len(responding_nids),
         )
 
-        # Clients that survived through the first unmask round.
+        # Clients that survived through the unmask stage.
         p3_clients = responding_nids
         stage3_dead = p2_clients - p3_clients
+        if stage3_dead:
+            log(
+                DEBUG,
+                "[SecAggPlusPlus Stage 3] Stage-3 dropouts: %s",
+                stage3_dead,
+            )
 
         b_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in stage2_dead}
-        u_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in stage3_dead}
-        self_masks: dict[int, bytes] = {}
+        u_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in p2_clients}
 
         for msg in msgs:
             if msg.has_error():
                 state.failures.append(Exception(msg.error))
                 continue
             res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
-            dead_lst = cast(list[int], res_dict[Key.NODE_ID_LIST])
+            nid_lst = cast(list[int], res_dict[Key.NODE_ID_LIST])
             share_lst = cast(list[bytes], res_dict[Key.SHARE_LIST])
-            self_mask = cast(bytes, res_dict[Key.SELF_MASK])
 
-            self_masks[msg.metadata.src_node_id] = self_mask
-
-            for idx, dead_nid in enumerate(dead_lst):
-                if dead_nid in stage2_dead:
-                    b_seed_shares[dead_nid].append(share_lst[idx])
-
-        # Round 2 (only needed for stage-3 dropouts): ask the surviving clients
-        # for the u_seed shares of clients that sent c_S but did not respond in
-        # round 1.
-        if stage3_dead:
-            log(
-                DEBUG,
-                "[SecAggPlusPlus Stage 3b] Requesting u_seed shares for %s stage-3 "
-                "dropouts from %s clients.",
-                len(stage3_dead),
-                len(p3_clients),
-            )
-            msgs2 = grid.send_and_receive(
-                [make(node_id, p3_clients, stage3_dead) for node_id in p3_clients],
-                timeout=self.timeout,
-            )
-            responding2 = {
-                msg.metadata.src_node_id for msg in msgs2 if not msg.has_error()
-            }
-            log(
-                DEBUG,
-                "[SecAggPlusPlus Stage 3b] Received u_seed shares from %s clients.",
-                len(responding2),
-            )
-            for msg in msgs2:
-                if msg.has_error():
-                    state.failures.append(Exception(msg.error))
-                    continue
-                res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
-                dead_lst = cast(list[int], res_dict[Key.NODE_ID_LIST])
-                share_lst = cast(list[bytes], res_dict[Key.SHARE_LIST])
-                for idx, dead_nid in enumerate(dead_lst):
-                    if dead_nid in stage3_dead:
-                        u_seed_shares[dead_nid].append(share_lst[idx])
+            for idx, owner_nid in enumerate(nid_lst):
+                if owner_nid in p2_clients:
+                    u_seed_shares[owner_nid].append(share_lst[idx])
+                elif owner_nid in stage2_dead:
+                    b_seed_shares[owner_nid].append(share_lst[idx])
 
         masked_vector = state.aggregate_ndarrays
         del state.aggregate_ndarrays
@@ -648,22 +619,18 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
         params = parameters_mod(params, state.mod_range)
 
         # Remove self masks for all clients whose c_S is in the aggregate.
+        # Every u_seed is reconstructed from threshold shares, matching the
+        # privacy model of classical SecAgg+.
         for nid in p2_clients:
-            if nid in p3_clients:
-                if nid not in self_masks:
-                    log(ERROR, "Missing self mask from client %d", nid)
-                    return False
-                u_seed = self_masks[nid]
-            else:
-                share_list = u_seed_shares[nid]
-                if len(share_list) < state.threshold:
-                    log(
-                        ERROR,
-                        "Not enough shares to recover u_seed for client %d",
-                        nid,
-                    )
-                    return False
-                u_seed = combine_shares(share_list)
+            share_list = u_seed_shares[nid]
+            if len(share_list) < state.threshold:
+                log(
+                    ERROR,
+                    "Not enough shares to recover u_seed for client %d",
+                    nid,
+                )
+                return False
+            u_seed = combine_shares(share_list)
             u_mask = pseudo_rand_gen(u_seed, state.mod_range, param_dimensions)
             params = parameters_subtraction(params, u_mask)
 
