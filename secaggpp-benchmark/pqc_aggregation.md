@@ -4,7 +4,7 @@ This document describes the post-quantum variant of Flower's SecAgg+ protocol im
 
 ## Cryptographic primitives
 
-- **Post-quantum public-key encryption** for transporting pairwise keys and Shamir shares between neighbours is built from **ML-KEM-768** plus **AES-GCM** authenticated encryption.  Concretely:
+- **Post-quantum public-key encryption** for transporting pairwise keys and Shamir shares between neighbours is built from **ML-KEM-768** plus **AES-GCM** authenticated encryption. Concretely:
 
   ```text
   Enc_AEAD(nonce, AD, key, message)
@@ -27,7 +27,7 @@ This document describes the post-quantum variant of Flower's SecAgg+ protocol im
   k_{S->R} = H(b_S || encoding(n_id_R))
   ```
 
-  where `H` is a 256-bit hash and `encoding(n_id_R)` is the 32-byte little-endian representation of the receiver's node id.  The full mask vector is obtained by applying a PRF to this key; each entry is produced from `ceiling(log_2(p)) + 128` bits before reduction modulo `p`:
+Where `H` is a 256-bit hash and `encoding(n_id_R)` is the 32-byte little-endian representation of the receiver's node id.  The full mask vector is obtained by applying a PRF to this key; each entry is produced from `ceiling(log_2(p)) + 128` bits before reduction modulo `p`:
 
   ```text
   mask_{S->R}[i] = PRF(k_{S->R}, i, ceiling(log_2(p)) + 128) mod p
