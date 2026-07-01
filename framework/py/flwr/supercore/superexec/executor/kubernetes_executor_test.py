@@ -14,6 +14,8 @@
 # ==============================================================================
 """Tests for SuperExec Kubernetes executor."""
 
+# pylint: disable=too-many-lines
+
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import Mock, call
@@ -208,6 +210,82 @@ def test_build_taskexecutor_pod_uses_secret_files_for_credentials() -> None:
     ]
     assert pod["spec"]["automountServiceAccountToken"] is False
     assert pod["spec"]["restartPolicy"] == "Never"
+
+
+def test_build_taskexecutor_pod_supports_explicit_env() -> None:
+    """Test Pod construction includes validated explicit container env."""
+    pod = _as_dict(
+        _build_taskexecutor_pod(
+            _execution_spec(),
+            _executor_config(
+                env=[
+                    {
+                        "name": "FLWR_MODEL_API_ENDPOINT",
+                        "value": "http://proxy/v1/responses",
+                    },
+                    {
+                        "name": "FLWR_WEB_SEARCH_ENDPOINT",
+                        "value": "http://proxy/v1/web-search",
+                    },
+                    {"name": "UV_INDEX_URL", "value": "https://pypi.org/simple"},
+                ]
+            ),
+            "root-ca",
+            _LAUNCH_ATTEMPT_ID,
+        )
+    )
+
+    assert pod["spec"]["containers"][0]["env"] == [
+        {"name": "FLWR_MODEL_API_ENDPOINT", "value": "http://proxy/v1/responses"},
+        {"name": "FLWR_WEB_SEARCH_ENDPOINT", "value": "http://proxy/v1/web-search"},
+        {"name": "UV_INDEX_URL", "value": "https://pypi.org/simple"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "FLWR_MODEL_API_KEY",
+        "BRAVE_API_KEY",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+    ],
+)
+def test_kubernetes_executor_config_rejects_provider_key_env_names(
+    env_name: str,
+) -> None:
+    """Test TaskExecutor env rejects exact provider key names."""
+    with pytest.raises(ValueError, match="TaskExecutor env name"):
+        _executor_config(env=[{"name": env_name, "value": "not-forwarded"}])
+
+
+@pytest.mark.parametrize(
+    ("env_entry", "expected_message"),
+    [
+        (
+            {"name": " FLWR_MODEL_API_ENDPOINT ", "value": "not-forwarded"},
+            "valid Kubernetes",
+        ),
+        (
+            {"name": "FLWR-MODEL-API-ENDPOINT", "value": "not-forwarded"},
+            "valid Kubernetes",
+        ),
+        ({"name": "1INVALID", "value": "not-forwarded"}, "valid Kubernetes"),
+        (
+            {
+                "name": "FLWR_MODEL_API_ENDPOINT",
+                "valueFrom": {"secretKeyRef": {"name": "proxy", "key": "url"}},
+            },
+            "valueFrom",
+        ),
+    ],
+)
+def test_kubernetes_executor_config_rejects_invalid_env_entries(
+    env_entry: object, expected_message: str
+) -> None:
+    """Test TaskExecutor env rejects invalid entries."""
+    with pytest.raises(ValueError, match=expected_message):
+        _executor_config(env=[env_entry])
 
 
 def test_build_taskexecutor_pod_supports_clientapp_insecure_args() -> None:
@@ -484,6 +562,7 @@ def test_wait_for_capacity_sleeps_and_polls_again_at_budget() -> None:
         {"items": []},
         {"items": [_pod("Pending")]},
         {"items": []},
+        {"items": []},
     ]
     client.list_namespaced_secret.return_value = {"items": []}
     sleep = Mock()
@@ -496,8 +575,46 @@ def test_wait_for_capacity_sleeps_and_polls_again_at_budget() -> None:
 
     KubernetesExecutor(client=client, config=config).wait_for_capacity()
 
-    assert client.list_namespaced_pod.call_count == 3
+    assert client.list_namespaced_pod.call_count == 4
+    assert client.list_namespaced_secret.call_count == 2
     sleep.assert_called_once_with(3.0)
+
+
+def test_wait_for_capacity_sweeps_after_waiting_for_capacity_to_open() -> None:
+    """Test completed Pod cleanup runs after a blocking capacity wait opens."""
+    client = Mock()
+    labels = _task_labels(123)
+    client.list_namespaced_pod.side_effect = [
+        {"items": []},
+        {"items": [_pod("Running", labels=labels)]},
+        {"items": [_pod("Succeeded", labels=labels)]},
+        {"items": [_pod("Succeeded", labels=labels)]},
+    ]
+    client.list_namespaced_secret.side_effect = [
+        {"items": []},
+        {"items": [_secret(_SECRET_NAME, labels)]},
+    ]
+    sleep = Mock()
+    config = _executor_config(
+        resource_pool="gpu-pool",
+        active_pod_budget=1,
+        capacity_poll_interval=3.0,
+        sleep=sleep,
+    )
+
+    KubernetesExecutor(client=client, config=config).wait_for_capacity()
+
+    assert client.list_namespaced_pod.call_count == 4
+    assert client.list_namespaced_secret.call_count == 2
+    sleep.assert_called_once_with(3.0)
+    client.delete_namespaced_pod.assert_called_once_with(
+        name=_POD_NAME,
+        namespace="flower-system",
+        grace_period_seconds=0,
+    )
+    client.delete_namespaced_secret.assert_called_once_with(
+        name=_SECRET_NAME, namespace="flower-system"
+    )
 
 
 def test_wait_for_capacity_counts_pending_running_and_terminating_active_pods() -> None:

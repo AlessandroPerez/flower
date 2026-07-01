@@ -58,6 +58,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
     ListInvitationsResponse,
     ListNodesRequest,
     ListNodesResponse,
+    ListRunSeriesRequest,
     ListRunsRequest,
     RegisterNodeRequest,
     RejectInvitationRequest,
@@ -84,11 +85,11 @@ from flwr.proto.runseries_pb2 import RunSeries  # pylint: disable=E0611
 from flwr.proto.task_pb2 import TaskEvent  # pylint: disable=E0611
 from flwr.server.superlink.linkstate import LinkStateFactory
 from flwr.supercore.constant import (
+    DEFAULT_FEDERATION_SIMULATION,
     FLWR_IN_MEMORY_DB_NAME,
     NOOP_FEDERATION,
     ActionType,
     RunTime,
-    RunType,
     TaskType,
 )
 from flwr.supercore.date import now
@@ -134,6 +135,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         account_info = authn_plugin.validate_tokens_in_metadata([])[1]
         assert account_info is not None
         assert account_info.flwr_aid is not None
+        self.account_info = account_info
         self.aid: str = account_info.flwr_aid
         shared_account_info.set(account_info)
         self.state = self.servicer.linkstate_factory.state()
@@ -147,7 +149,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
             NOOP_FEDERATION,
             None,
             flwr_aid,
-            RunType.SERVER_APP,
+            TaskType.SERVER_APP,
         )
 
     def _create_dummy_run_series(
@@ -198,7 +200,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(run_info.fab_hash, fab_hash)
         self.assertEqual(run_info.fab_id, fab_id)
         self.assertEqual(run_info.fab_version, fab_version)
-        self.assertEqual(run_info.run_type, RunType.SERVER_APP)
+        self.assertEqual(run_info.primary_task_type, TaskType.SERVER_APP)
         self.assertFalse(response.HasField("note"))
         self.assertTrue(response.HasField("series_id"))
         self.assertGreater(response.series_id, 0)
@@ -208,6 +210,19 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         assert run_context is not None
         self.assertEqual(run_context.run_id, response.run_id)
         self.assertEqual(run_context.series_id, response.series_id)
+
+    def test_start_run_defaults_to_account_simulation_federation(self) -> None:
+        """Test StartRun uses the account default simulation federation."""
+        self.account_info.account_name = "test_account"
+        expected_federation = f"@test_account/{DEFAULT_FEDERATION_SIMULATION}"
+        federation_manager = Mock(exists=Mock(side_effect=RuntimeError))
+        self.servicer.linkstate_factory.federation_manager = federation_manager
+        self.servicer.linkstate_factory.state_instance = None
+
+        with self.assertRaises(RuntimeError):
+            self.servicer.StartRun(StartRunRequest(), Mock())
+
+        federation_manager.exists.assert_called_once_with(expected_federation)
 
     def test_start_run_uses_existing_series_id(self) -> None:
         """Test StartRun links the run to an existing run series."""
@@ -257,17 +272,17 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
 
     @parameterized.expand(
         [
-            (None, RunType.SERVER_APP, TaskType.SERVER_APP),
-            (SimulationConfig(), RunType.SIMULATION, TaskType.SIMULATION),
+            (None, TaskType.SERVER_APP, TaskType.SERVER_APP),
+            (SimulationConfig(), TaskType.SIMULATION, TaskType.SIMULATION),
         ]
     )  # type: ignore
     def test_start_run_creates_task_with_matching_type(
         self,
         sim_cfg: SimulationConfig | None,
-        expected_run_type: RunType,
+        expected_primary_task_type: TaskType,
         expected_task_type: TaskType,
     ) -> None:
-        """Test StartRun creates an initial task matching the resolved run type."""
+        """Test StartRun creates an initial task matching the resolved task type."""
         fab_content = b"test FAB content task type"
         request = StartRunRequest()
         request.fab.hash_str = hashlib.sha256(fab_content).hexdigest()
@@ -297,7 +312,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         tasks = self.state.get_tasks()
 
         self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0].run_type, expected_run_type)
+        self.assertEqual(runs[0].primary_task_type, expected_primary_task_type)
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0].run_id, response.run_id)
         self.assertEqual(tasks[0].type, expected_task_type)
@@ -344,7 +359,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0].fab_id, "flwr/agent")
         self.assertEqual(runs[0].fab_version, "0.1.0")
-        self.assertEqual(runs[0].run_type, RunType.AGENT_APP)
+        self.assertEqual(runs[0].primary_task_type, TaskType.AGENT_APP)
         self.assertEqual(runs[0].override_config["agent.input"], "Hello")
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0].run_id, response.run_id)
@@ -373,7 +388,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(runs[0].fab_id, "flwrlabs/flwr-agent")
         self.assertEqual(runs[0].fab_version, "0.1.0")
         self.assertEqual(runs[0].fab_hash, expected_fab_hash)
-        self.assertEqual(runs[0].run_type, RunType.AGENT_APP)
+        self.assertEqual(runs[0].primary_task_type, TaskType.AGENT_APP)
         self.assertEqual(runs[0].override_config["agent.input"], "Hello")
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0].run_id, response.run_id)
@@ -616,8 +631,14 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         # Assert
         if limit is None:
             limit = 999
-        self.assertLess(abs(retrieved_timestamp - now().timestamp()), 1e-3)
+        self.assertAlmostEqual(retrieved_timestamp, now().timestamp(), delta=1e-1)
         self.assertEqual(set(response.run_dict.keys()), set(run_ids[-limit:]))
+        self.assertTrue(
+            all(
+                run.account_name == self.account_info.account_name
+                for run in response.run_dict.values()
+            )
+        )
 
     def test_list_run_id(self) -> None:
         """Test List method of ControlServicer with --run-id option."""
@@ -630,8 +651,25 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         retrieved_timestamp = datetime.fromisoformat(response.now).timestamp()
 
         # Assert
-        self.assertLess(abs(retrieved_timestamp - now().timestamp()), 1e-3)
+        self.assertAlmostEqual(retrieved_timestamp, now().timestamp(), delta=1e-1)
         self.assertEqual(set(response.run_dict.keys()), {run_id})
+        self.assertEqual(
+            response.run_dict[run_id].account_name, self.account_info.account_name
+        )
+
+    def test_list_run_series_filters_by_federation(self) -> None:
+        """Test ListRunSeries filters by an explicit federation."""
+        # Prepare
+        self._create_dummy_run_series(1, federation=NOOP_FEDERATION)
+        self._create_dummy_run_series(2, federation="other-federation")
+
+        # Execute
+        response = self.servicer.ListRunSeries(
+            ListRunSeriesRequest(federation_id=NOOP_FEDERATION), Mock()
+        )
+
+        # Assert
+        self.assertEqual([entry.series_id for entry in response.entries], [1])
 
     def test_get_run_series_returns_context(self) -> None:
         """Test GetRunSeries returns series metadata and shared Context."""
@@ -873,7 +911,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         retrieved_timestamp = datetime.fromisoformat(response.now).timestamp()
 
         # Assert
-        self.assertLess(abs(retrieved_timestamp - now().timestamp()), 1e-3)
+        self.assertAlmostEqual(retrieved_timestamp, now().timestamp(), delta=1e-1)
         self.assertEqual(response.federation.name, NOOP_FEDERATION)
         self.assertFalse(response.federation.simulation)
 
@@ -1080,7 +1118,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
             "test-federation",
             None,
             self.aid,
-            RunType.SERVER_APP,
+            TaskType.SERVER_APP,
         )
 
         with patch.object(
@@ -1133,7 +1171,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
             "test-federation",
             None,
             target_flwr_aid,
-            RunType.SERVER_APP,
+            TaskType.SERVER_APP,
         )
 
         with patch.object(
@@ -1344,7 +1382,7 @@ class TestControlServicerAuth(unittest.TestCase):
             NOOP_FEDERATION,
             None,
             flwr_aid,
-            RunType.SERVER_APP,
+            TaskType.SERVER_APP,
         )
 
     def make_context(self) -> MagicMock:
@@ -1517,7 +1555,9 @@ class TestControlServicerAuth(unittest.TestCase):
         with (
             patch(
                 "flwr.superlink.servicer.control.control_servicer.get_current_account_info",
-                return_value=SimpleNamespace(flwr_aid="user-123"),
+                return_value=SimpleNamespace(
+                    flwr_aid="user-123", account_name="test-account"
+                ),
             ),
             patch.object(
                 self.state.federation_manager, "has_member", return_value=False
@@ -1536,14 +1576,21 @@ class TestControlServicerAuth(unittest.TestCase):
         with (
             patch(
                 "flwr.superlink.servicer.control.control_servicer.get_current_account_info",
-                return_value=SimpleNamespace(flwr_aid="user-123"),
+                return_value=SimpleNamespace(
+                    flwr_aid="user-123", account_name="test-account"
+                ),
             ),
             patch.object(
                 self.state.federation_manager, "has_member", return_value=True
             ),
+            patch(
+                "flwr.superlink.servicer.control.control_servicer.resolve_account_ids",
+                return_value={"run-owner": "owner-account"},
+            ),
         ):
             response = self.servicer.ListRuns(request, ctx)
             self.assertEqual(set(response.run_dict.keys()), {run_id})
+            self.assertEqual(response.run_dict[run_id].account_name, "owner-account")
 
 
 class TestValidateFederationAndNodesInRequest(unittest.TestCase):

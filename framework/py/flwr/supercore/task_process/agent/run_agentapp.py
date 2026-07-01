@@ -33,9 +33,7 @@ from flwr.common.config import (
     get_project_dir,
 )
 from flwr.common.constant import RUNTIME_DEPENDENCY_INSTALL, SubStatus
-from flwr.common.exit import ExitCode, flwr_exit, register_signal_handlers
 from flwr.common.logger import flush_logs, log, start_log_uploader, stop_log_uploader
-from flwr.common.object_ref import load_app
 from flwr.common.serde import (
     context_from_proto,
     context_to_proto,
@@ -48,7 +46,9 @@ from flwr.proto.appio_pb2 import (  # pylint: disable=E0611
     PushTaskOutputRequest,
 )
 from flwr.supercore.app_utils import start_parent_process_monitor
+from flwr.supercore.exit import ExitCode, flwr_exit, register_signal_handlers
 from flwr.supercore.heartbeat import HeartbeatSender, make_task_heartbeat_fn_grpc
+from flwr.supercore.object_ref import load_app
 from flwr.supercore.superexec.dependency_installer import (
     RuntimeDependencyInstallationError,
     cleanup_app_runtime_environment,

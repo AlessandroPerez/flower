@@ -22,7 +22,6 @@ from typing import TypeVar, cast
 
 from google.protobuf.message import Message as GrpcMessage
 
-from flwr.common.exit import ExitCode, flwr_exit
 from flwr.proto.fab_pb2 import GetFabRequest, GetFabResponse  # pylint: disable=E0611
 from flwr.proto.fleet_pb2 import (  # pylint: disable=E0611
     ActivateNodeRequest,
@@ -53,11 +52,12 @@ from flwr.proto.message_pb2 import (  # pylint: disable=E0611
 from flwr.proto.run_pb2 import GetRunRequest, GetRunResponse  # pylint: disable=E0611
 from flwr.server.superlink.fleet.message_handler import message_handler
 from flwr.server.superlink.linkstate import LinkState, LinkStateFactory
+from flwr.supercore.exit import ExitCode, flwr_exit
 from flwr.supercore.object_store import ObjectStore, ObjectStoreFactory
 
 try:
     from starlette.applications import Starlette
-    from starlette.datastructures import Headers
+    from starlette.datastructures import Headers, State
     from starlette.exceptions import HTTPException
     from starlette.requests import Request
     from starlette.responses import Response
@@ -70,7 +70,7 @@ GrpcRequest = TypeVar("GrpcRequest", bound=GrpcMessage)
 GrpcResponse = TypeVar("GrpcResponse", bound=GrpcMessage)
 
 GrpcAsyncFunction = Callable[[GrpcRequest], Awaitable[GrpcResponse]]
-RestEndPoint = Callable[[Request], Awaitable[Response]]
+RestEndPoint = Callable[[Request[State]], Awaitable[Response]]
 
 routes = []
 
@@ -82,7 +82,7 @@ def rest_request_response(
 
     def decorator(func: GrpcAsyncFunction[GrpcRequest, GrpcResponse]) -> RestEndPoint:
 
-        async def wrapper(request: Request) -> Response:
+        async def wrapper(request: Request[State]) -> Response:
             _check_headers(request.headers)
 
             # Get the request body as raw bytes
