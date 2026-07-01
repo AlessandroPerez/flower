@@ -23,10 +23,10 @@ CLASSICAL_DIR="${CLASSICAL_DIR:-$SCRIPT_DIR/benchmark-apps/classical}"
 PP_DIR="${PP_DIR:-$SCRIPT_DIR/benchmark-apps/pp}"
 
 # A single shared virtualenv is enough because both apps have identical
-# dependencies.  It is kept outside the app dirs so `flwr run` does not trip
-# over the max-directory-depth check on .venv.
-CLASSICAL_ENV="${CLASSICAL_ENV:-$SCRIPT_DIR/.secagg-bench-venvs/bench-venv}"
-PP_ENV="${PP_ENV:-$SCRIPT_DIR/.secagg-bench-venvs/bench-venv}"
+# dependencies.  It is kept outside the project tree so `flwr run` does not
+# trip over the max-directory-depth check on .venv.
+CLASSICAL_ENV="${CLASSICAL_ENV:-/tmp/secagg-bench-venv}"
+PP_ENV="${PP_ENV:-/tmp/secagg-bench-venv}"
 
 PYTHON_VERSION="3.11.14"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
@@ -78,7 +78,8 @@ run_benchmark() {
             --run-config "min-fit-clients=$N" \
             --run-config "min-available-clients=$N" \
             --run-config "num-shares=$DEGREE" \
-            --run-config "reconstruction-threshold=$THRESHOLD"
+            --run-config "reconstruction-threshold=$THRESHOLD" \
+            --run-config "num-server-rounds=3"
     ) >"$log" 2>&1
 
     # Strip ANSI colour codes and extract the final timing reported by Flower.
@@ -98,7 +99,7 @@ run_benchmark() {
     fi
 }
 
-echo "Benchmarking SecAgg+ vs SecAgg++ with $N clients, degree=$DEGREE, threshold=$THRESHOLD (3 rounds each)" >&2
+echo "Benchmarking SecAgg+ vs SecAgg++ with $N clients, degree=$DEGREE, threshold=$THRESHOLD (3 server rounds)" >&2
 echo "" >&2
 
 # Warm-up: download and cache the CIFAR-10 dataset before the timed runs so

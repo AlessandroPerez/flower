@@ -180,15 +180,15 @@ def pseudo_rand_gen_secure(
     """Cryptographically secure seeded pseudo-random mask generator.
 
     This is the SecAgg++-specific variant of :func:`pseudo_rand_gen`.  Each
-    output element is produced from ``ceil(log2(num_range)) + 128`` bits of a
-    SHAKE256 XOF stream keyed by ``seed``, then reduced modulo ``num_range``.
+    output element is produced from ``ceil(log2(num_range)) + 128`` bits of an
+    AES-256-CTR keystream keyed by ``seed``, then reduced modulo ``num_range``.
     The extra 128 bits of margin keep the modular-reduction bias negligible
     even when ``num_range`` is not a power of two.
 
     Parameters
     ----------
     seed : bytes
-        Seed for the generator.
+        32-byte seed/key for the generator.
     num_range : int
         Upper bound (exclusive) of each generated value.
     dimensions_list : list[tuple[int, ...]]
@@ -199,10 +199,12 @@ def pseudo_rand_gen_secure(
     list[NDArrayInt]
         A list of pseudo-random integer arrays matching ``dimensions_list``.
     """
-    from cryptography.hazmat.primitives.hashes import SHAKE256, Hash
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     if num_range <= 0:
         raise ValueError("`num_range` must be positive.")
+    if len(seed) != 32:
+        raise ValueError("`seed` must be 32 bytes for AES-256.")
 
     total_elements = sum(int(np.prod(dim)) if dim else 1 for dim in dimensions_list)
     if total_elements == 0:
@@ -215,16 +217,17 @@ def pseudo_rand_gen_secure(
     bytes_per_value = (bits_per_value + 7) // 8
 
     total_bytes = total_elements * bytes_per_value
-    xof = Hash(SHAKE256(digest_size=total_bytes))
-    xof.update(seed)
-    random_bytes = np.frombuffer(xof.finalize(), dtype=np.uint8).reshape(
-        total_elements, bytes_per_value
-    )
+    # Each seed is used for a single mask, so a fixed IV is safe.  The
+    # deterministic output is the same as a one-time keystream expansion.
+    cipher = Cipher(algorithms.AES(seed), modes.CTR(b"\x00" * 16))
+    encryptor = cipher.encryptor()
+    random_bytes = np.frombuffer(
+        encryptor.update(b"\x00" * total_bytes) + encryptor.finalize(), dtype=np.uint8
+    ).reshape(total_elements, bytes_per_value)
 
     # Convert big-endian byte chunks to integers and reduce mod num_range.
-    ints = np.zeros(total_elements, dtype=np.int64)
-    for i in range(bytes_per_value):
-        ints = ((ints << 8) + random_bytes[:, i].astype(np.int64)) % num_range
+    powers = 256 ** np.arange(bytes_per_value - 1, -1, -1, dtype=np.int64)
+    ints = random_bytes.astype(np.int64).dot(powers) % num_range
 
     output: list[NDArrayInt] = []
     offset = 0

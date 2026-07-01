@@ -26,6 +26,7 @@ import flwr.compat.common.recorddict_compat as compat
 from flwr.app import ConfigRecord, Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.common import FitRes, NDArrays, bytes_to_ndarray, log, ndarrays_to_parameters
+from flwr.common.secure_aggregation.crypto.pq_pke import aead_decrypt, aead_encrypt
 from flwr.common.secure_aggregation.crypto.shamir import combine_shares
 from flwr.common.secure_aggregation.ndarrays_arithmetic import (
     factor_extract,
