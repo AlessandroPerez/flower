@@ -28,7 +28,8 @@ from flwr.common.secure_aggregation.ndarrays_arithmetic import (
 )
 from flwr.common.secure_aggregation.crypto.shamir import combine_shares
 from flwr.common.secure_aggregation.secaggplus_constants import Key, Stage
-from flwr.common.secure_aggregation.secaggplus_utils import pseudo_rand_gen
+from flwr.common.secure_aggregation.crypto.pq_pke import aead_decrypt, aead_encrypt
+from flwr.common.secure_aggregation.secaggplus_utils import pseudo_rand_gen_secure
 
 from .secaggplus_plus_mod import (
     SecAggPlusPlusState,
@@ -37,6 +38,17 @@ from .secaggplus_plus_mod import (
     _share_keys,
     _unmask,
 )
+
+
+def _server_rewrap(
+    outer: bytes, src: int, dst: int, server_keys: dict[int, bytes]
+) -> bytes:
+    """Simulate the server-side onion re-encryption layer."""
+    ad = int.to_bytes(src, 8, "little", signed=False) + int.to_bytes(
+        dst, 8, "little", signed=False
+    )
+    inner = aead_decrypt(server_keys[src], outer, ad)
+    return aead_encrypt(server_keys[dst], inner, ad)
 
 
 def _make_state(nid: int) -> SecAggPlusPlusState:
@@ -91,6 +103,8 @@ class TestSecAggPlusPlusMod:
         res2 = _share_keys(state2, share_cfg2)
 
         # Route ciphertexts: client 1 receives client 2's message and vice versa.
+        # The server would have stripped the sender-side onion layer and added
+        # the receiver-side onion layer; simulate that here.
         srcs1 = cast(list[int], res1[Key.SOURCE_LIST])
         dsts1 = cast(list[int], res1[Key.DESTINATION_LIST])
         cts1 = cast(list[bytes], res1[Key.CIPHERTEXT_LIST])
@@ -98,8 +112,13 @@ class TestSecAggPlusPlusMod:
         dsts2 = cast(list[int], res2[Key.DESTINATION_LIST])
         cts2 = cast(list[bytes], res2[Key.CIPHERTEXT_LIST])
 
-        ct_for_1 = cts2[dsts2.index(1)]
-        ct_for_2 = cts1[dsts1.index(2)]
+        server_keys = {1: state1.server_key, 2: state2.server_key}
+        ct_for_1 = _server_rewrap(
+            cts2[dsts2.index(1)], srcs2[dsts2.index(1)], 1, server_keys
+        )
+        ct_for_2 = _server_rewrap(
+            cts1[dsts1.index(2)], srcs1[dsts1.index(2)], 2, server_keys
+        )
 
         collect_cfg1 = ConfigRecord(
             {
@@ -174,7 +193,7 @@ class TestSecAggPlusPlusMod:
         for nid in (1, 2):
             u_seed = combine_shares(u_seed_shares[nid])
             params_aggregate = parameters_subtraction(
-                params_aggregate, pseudo_rand_gen(u_seed, 1024, dims)
+                params_aggregate, pseudo_rand_gen_secure(u_seed, 1024, dims)
             )
         params_aggregate = parameters_mod(params_aggregate, 1024)
         aggregate[1] = params_aggregate[0]
@@ -217,7 +236,9 @@ class TestSecAggPlusPlusMod:
             nid: _share_keys(state, share_cfgs[nid]) for nid, state in states.items()
         }
 
-        # Route ciphertexts to each client.
+        # Route ciphertexts to each client, simulating the server's onion
+        # re-encryption layer.
+        server_keys = {nid: state.server_key for nid, state in states.items()}
         collect_cfgs: dict[int, ConfigRecord] = {}
         for nid, _state in states.items():
             srcs: list[int] = []
@@ -230,7 +251,7 @@ class TestSecAggPlusPlusMod:
                 cts_for = cast(list[bytes], res[Key.CIPHERTEXT_LIST])
                 idx = dsts.index(nid)
                 srcs.append(other_nid)
-                cts.append(cts_for[idx])
+                cts.append(_server_rewrap(cts_for[idx], other_nid, nid, server_keys))
             collect_cfgs[nid] = ConfigRecord(
                 {
                     Key.STAGE: Stage.COLLECT_MASKED_VECTORS,
@@ -295,7 +316,7 @@ class TestSecAggPlusPlusMod:
         for nid in (1, 2, 3):
             u_seed = combine_shares(u_seed_shares[nid])
             params_aggregate = parameters_subtraction(
-                params_aggregate, pseudo_rand_gen(u_seed, 1024, dims)
+                params_aggregate, pseudo_rand_gen_secure(u_seed, 1024, dims)
             )
         aggregate[1] = parameters_mod(params_aggregate, 1024)[0]
         aggregate = parameters_mod(aggregate, 1024)
@@ -351,5 +372,5 @@ class TestSecAggPlusPlusMod:
 
         # e_S should contain the mask derived for the stage-2 dropout only.
         e_s = [bytes_to_ndarray(b) for b in cast(list[bytes], res[Key.E_VALUE])]
-        expected_e = pseudo_rand_gen(b"\x01" * 32, 1024, [(2,)])
+        expected_e = pseudo_rand_gen_secure(b"\x01" * 32, 1024, [(2,)])
         np.testing.assert_array_equal(e_s[0], expected_e[0])

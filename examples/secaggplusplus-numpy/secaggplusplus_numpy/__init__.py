@@ -1,0 +1,1 @@
+"""SecAgg++ NumPy demo package."""

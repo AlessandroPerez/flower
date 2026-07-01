@@ -5,8 +5,7 @@ Averaging protected by SecAgg+. It sweeps over client counts, dropout rates,
 and implementations:
 
 - classical SecAgg+ (``SecAggPlusWorkflow`` + ``secaggplus_mod``)
-- single-KEM PQ SecAgg+ (``SecAggPlusPQWorkflow(..., single_kem=True)`` +
-  ``secaggplus_pq_mod``)
+- SecAgg++ (``SecAggPlusPlusWorkflow`` + ``secaggplus_plus_mod``)
 
 The local model is multinomial logistic regression (softmax) implemented in
 NumPy. It is small, converges quickly, and keeps the benchmark focused on the
@@ -22,6 +21,7 @@ import random
 import time
 import uuid
 from collections.abc import Callable, Iterable
+from math import ceil, log2
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ from flwr.app import Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.client.mod import make_ffn
 from flwr.client.mod.secure_aggregation.secaggplus_mod import secaggplus_mod
-from flwr.client.mod.secure_aggregation.secaggplus_pq_mod import secaggplus_pq_mod
+from flwr.client.mod.secure_aggregation.secaggplus_plus_mod import secaggplus_plus_mod
 from flwr.common import (
     Code,
     FitRes,
@@ -39,16 +39,11 @@ from flwr.common import (
     ndarrays_to_parameters,
     parameters_to_ndarrays,
 )
-from flwr.common.secure_aggregation.crypto.degree_threshold import (
-    compute_degree_and_threshold,
-)
 from flwr.common.secure_aggregation.secaggplus_constants import (
     RECORD_KEY_CONFIGS as SECAGG_RECORD_KEY_CONFIGS,
 )
-from flwr.common.secure_aggregation.secaggplus_constants import (
-    Key as SecAggKey,
-    Stage as SecAggStage,
-)
+from flwr.common.secure_aggregation.secaggplus_constants import Key as SecAggKey
+from flwr.common.secure_aggregation.secaggplus_constants import Stage as SecAggStage
 from flwr.compat.common import recorddict_compat as compat
 from flwr.server.client_manager import ClientManager, SimpleClientManager
 from flwr.server.compat.legacy_context import LegacyContext
@@ -56,8 +51,8 @@ from flwr.server.server_config import ServerConfig
 from flwr.server.strategy import FedAvg
 from flwr.server.workflow import DefaultWorkflow
 from flwr.server.workflow.constant import MAIN_PARAMS_RECORD
-from flwr.server.workflow.secure_aggregation.secaggplus_pq_workflow import (
-    SecAggPlusPQWorkflow,
+from flwr.server.workflow.secure_aggregation.secaggplus_plus_workflow import (
+    SecAggPlusPlusWorkflow,
 )
 from flwr.server.workflow.secure_aggregation.secaggplus_workflow import (
     SecAggPlusWorkflow,
@@ -80,14 +75,8 @@ LEARNING_RATE: float = 0.1
 BATCH_SIZE: int = 64
 RANDOM_SEED: int = 42
 
-# Security / graph parameters for adaptive degree computation.
-GAMMA: float = 0.01
-DELTA: float = 0.01
-SIGMA: int = 20
-ETA: int = 20
-
-# Output directory (relative to the current working directory).
-OUT_DIR = Path("speed_tests")
+# Output directory (next to this script).
+OUT_DIR = Path(__file__).resolve().parent
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 JSON_PATH = OUT_DIR / "flower_secagg_mnist_benchmark.json"
 
@@ -456,16 +445,11 @@ def _choose_dropped(n: int, rate: float, run: int) -> set[int]:
 
 
 def _degree_threshold_with_fallback(n: int, dropout_rate: float) -> tuple[int, int]:
-    """Return adaptive (k, t); fall back to a complete graph if needed."""
-    try:
-        return compute_degree_and_threshold(n, GAMMA, dropout_rate, SIGMA, ETA)
-    except ValueError:
-        # The workflow forces num_shares to be odd and <= n. Ensure the
-        # resulting threshold is strictly smaller than the adjusted num_shares.
-        num_shares = n if n % 2 == 1 else n - 1
-        active = max(2, n - int(round(n * dropout_rate)))
-        threshold = min(max(2, active - 1), num_shares - 1)
-        return num_shares, threshold
+    """Return a log-spaced degree and a dropout-tolerant threshold."""
+    degree = min(n, 2 * ceil(log2(n)) + 1)
+    active = max(2, n - int(round(n * dropout_rate)))
+    threshold = min(max(2, active - 1), degree - 1)
+    return degree, threshold
 
 
 def _make_workflow(
@@ -483,15 +467,10 @@ def _make_workflow(
             quantization_range=2**20,
             modulus_range=2**30,
         )
-    if impl == "pq_single":
-        return SecAggPlusPQWorkflow(
-            single_kem=True,
+    if impl == "secaggplusplus":
+        return SecAggPlusPlusWorkflow(
             num_shares=k,
             reconstruction_threshold=t,
-            gamma=GAMMA,
-            delta=dropout_rate,
-            sigma=SIGMA,
-            eta=ETA,
             max_weight=max_weight,
             clipping_range=10.0,
             quantization_range=2**20,
@@ -506,8 +485,8 @@ def _make_client_modifier(
     """Return the SecAgg client modifier for the requested implementation."""
     if impl == "classical":
         return secaggplus_mod
-    if impl == "pq_single":
-        return secaggplus_pq_mod
+    if impl == "secaggplusplus":
+        return secaggplus_plus_mod
     raise ValueError(f"Unknown implementation: {impl}")
 
 
@@ -626,9 +605,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--impls",
         nargs="+",
-        default=["classical", "pq_single"],
-        choices=["classical", "pq_single"],
-        help="Implementations to benchmark (default: classical pq_single).",
+        default=["classical", "secaggplusplus"],
+        choices=["classical", "secaggplusplus"],
+        help="Implementations to benchmark (default: classical secaggplusplus).",
     )
     parser.add_argument(
         "--runs",

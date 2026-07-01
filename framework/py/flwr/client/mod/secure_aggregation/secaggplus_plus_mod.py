@@ -19,24 +19,32 @@ from __future__ import annotations
 
 import os
 import pickle
-from dataclasses import dataclass, field
-from logging import DEBUG, WARNING
+import time
+from dataclasses import MISSING, dataclass, field, fields
+from logging import DEBUG, INFO, WARNING
 from typing import Any, cast
 
 import numpy as np
+
 from flwr.app import ConfigRecord, Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.app.typing import ConfigRecordValues
 from flwr.clientapp.typing import ClientAppCallable
 from flwr.common import NDArrays, Parameters, ndarray_to_bytes, parameters_to_ndarrays
 from flwr.common.logger import log
-from flwr.common.secure_aggregation.crypto.pq_pke import (
-    decrypt as pke_decrypt,
+from flwr.common.secure_aggregation.crypto.pq_kem import (
+    CIPHERTEXT_LEN,
+    decapsulate_secret,
+    derive_pairwise_secret,
+    derive_share_encryption_key,
+    encapsulate,
 )
 from flwr.common.secure_aggregation.crypto.pq_pke import (
-    encrypt as pke_encrypt,
+    NONCE_LEN,
+    aead_decrypt,
+    aead_encrypt,
+    generate_keypair,
 )
-from flwr.common.secure_aggregation.crypto.pq_pke import generate_keypair
 from flwr.common.secure_aggregation.crypto.shamir import create_shares
 from flwr.common.secure_aggregation.ndarrays_arithmetic import (
     factor_combine,
@@ -53,7 +61,7 @@ from flwr.common.secure_aggregation.secaggplus_constants import (
 )
 from flwr.common.secure_aggregation.secaggplus_utils import (
     derive_pairwise_key,
-    pseudo_rand_gen,
+    pseudo_rand_gen_secure,
     share_keys_plaintext_concat_plus,
     share_keys_plaintext_separate_plus,
 )
@@ -102,8 +110,26 @@ class SecAggPlusPlusState:
     received_b_shares: dict[int, bytes] = field(default_factory=dict)
     # u_seed shares received from neighbours
     received_u_shares: dict[int, bytes] = field(default_factory=dict)
+    # One-way shared secrets this client encapsulated to each neighbour.
+    shared_secrets: dict[int, bytes] = field(default_factory=dict)
+    # One-way shared secrets received from each neighbour.
+    received_secrets: dict[int, bytes] = field(default_factory=dict)
+    # Bidirectional secrets derived from both one-way directions.
+    pairwise_secrets: dict[int, bytes] = field(default_factory=dict)
+    # Symmetric key shared between this client and the server for the
+    # client-server onion-encryption layer.
+    server_key: bytes = b""
 
     def __init__(self, **kwargs: ConfigRecordValues) -> None:
+        # Apply dataclass defaults for any field not supplied by the caller.
+        for field_obj in fields(self):
+            if field_obj.name in kwargs:
+                continue
+            if field_obj.default_factory is not MISSING:
+                self.__setattr__(field_obj.name, field_obj.default_factory())
+            elif field_obj.default is not MISSING:
+                self.__setattr__(field_obj.name, field_obj.default)
+
         for k, v in kwargs.items():
             if k.endswith(":V"):
                 continue
@@ -160,11 +186,22 @@ def secaggplus_plus_mod(
     elif state.current_stage == Stage.SHARE_KEYS:
         res = _share_keys(state, configs)
     elif state.current_stage == Stage.COLLECT_MASKED_VECTORS:
+        _ct = time.perf_counter()
         out_msg = call_next(msg, ctxt)
+        _call_next_t = time.perf_counter() - _ct
         out_content = out_msg.content
         fitres = compat.recorddict_to_fitres(out_content, keep_input=True)
+        _ct = time.perf_counter()
         res = _collect_masked_vectors(
             state, configs, fitres.num_examples, fitres.parameters
+        )
+        _mask_t = time.perf_counter() - _ct
+        log(
+            INFO,
+            "Node %d: collect_masked: call_next=%.4fs mask=%.4fs",
+            state.nid,
+            _call_next_t,
+            _mask_t,
         )
         for arr_record in out_content.array_records.values():
             arr_record.clear()
@@ -216,7 +253,7 @@ def check_configs(stage: str, configs: ConfigRecord) -> None:
             (Key.CLIPPING_RANGE, float),
             (Key.TARGET_RANGE, int),
             (Key.MOD_RANGE, int),
-            (Key.MAX_WEIGHT, float),
+            (Key.MAX_WEIGHT, (int, float)),
         ]
         for key, expected_type in key_type_pairs:
             if key not in configs:
@@ -224,19 +261,32 @@ def check_configs(stage: str, configs: ConfigRecord) -> None:
                     f"Stage {Stage.SETUP}: the required key '{key}' is "
                     "missing from the ConfigRecord."
                 )
-            if (
-                type(configs[key]) is not expected_type
-            ):  # pylint: disable=unidiomatic-typecheck
+            actual_type = type(configs[key])
+            if isinstance(expected_type, tuple):
+                type_ok = actual_type in expected_type
+            else:
+                type_ok = actual_type is expected_type
+            if not type_ok:  # pylint: disable=unidiomatic-typecheck
                 raise TypeError(
                     f"Stage {Stage.SETUP}: The value for the key '{key}' "
                     f"must be of type {expected_type}, "
-                    f"but got {type(configs[key])} instead."
+                    f"but got {actual_type} instead."
                 )
+
     elif stage == Stage.SHARE_KEYS:
         for key, value in configs.items():
             if key == Key.STAGE:
                 continue
-            if not isinstance(value, bytes):
+            if key == Key.NEIGHBOUR_LIST:
+                if not isinstance(value, list) or any(
+                    type(elm) is not int  # pylint: disable=unidiomatic-typecheck
+                    for elm in cast(list[Any], value)
+                ):
+                    raise TypeError(
+                        f"Stage {Stage.SHARE_KEYS}: "
+                        f"the value for the key '{key}' must be List[int]."
+                    )
+            elif not isinstance(value, bytes):
                 raise TypeError(
                     f"Stage {Stage.SHARE_KEYS}: "
                     f"the value for the key '{key}' must be bytes."
@@ -261,7 +311,7 @@ def check_configs(stage: str, configs: ConfigRecord) -> None:
                 raise TypeError(
                     f"Stage {Stage.COLLECT_MASKED_VECTORS}: "
                     f"the value for the key '{key}' "
-                    f"must be of type List[{expected_type.__name__}]"
+                    f"must be of type List[{cast(type, expected_type).__name__}]"
                 )
     elif stage == Stage.UNMASK:
         key_type_pairs = [
@@ -279,10 +329,17 @@ def check_configs(stage: str, configs: ConfigRecord) -> None:
             ):
                 raise TypeError(
                     f"Stage {Stage.UNMASK}: the value for the key '{key}' "
-                    f"must be of type List[{expected_type.__name__}]"
+                    f"must be of type List[{cast(type, expected_type).__name__}]"
                 )
     else:
         raise ValueError(f"Unknown secagg stage: {stage}")
+
+
+def _make_ad(src_node_id: int, dst_node_id: int) -> bytes:
+    """Encode (source, destination) as AEAD associated data."""
+    return int.to_bytes(src_node_id, 8, "little", signed=False) + int.to_bytes(
+        dst_node_id, 8, "little", signed=False
+    )
 
 
 def _setup(
@@ -295,7 +352,7 @@ def _setup(
     state.clipping_range = cast(float, configs[Key.CLIPPING_RANGE])
     state.target_range = cast(int, configs[Key.TARGET_RANGE])
     state.mod_range = cast(int, configs[Key.MOD_RANGE])
-    state.max_weight = cast(float, configs[Key.MAX_WEIGHT])
+    state.max_weight = float(cast(float, configs[Key.MAX_WEIGHT]))
 
     state.public_keys_dict = {}
     state.b_seed_shares = {}
@@ -308,10 +365,21 @@ def _setup(
     state.b_seed = os.urandom(32)
     state.u_seed = os.urandom(32)
 
-    state.pk, state.sk = generate_keypair()
+    # Reuse the long-term ML-KEM keypair across rounds.  Only the mask seeds
+    # need to be fresh each round.
+    if not state.pk or not state.sk:
+        state.pk, state.sk = generate_keypair()
+
+    # Establish a client-server symmetric key for the outer onion-encryption
+    # layer.  Reuse it across rounds like the ML-KEM keypair.
+    if not state.server_key:
+        state.server_key = os.urandom(32)
 
     log(DEBUG, "Node %d: SecAggPlusPlus stage 0 completes.", state.nid)
-    return {Key.PUBLIC_KEY_PAIRWISE: state.pk}
+    return {
+        Key.PUBLIC_KEY_PAIRWISE: state.pk,
+        Key.SERVER_KEY: state.server_key,
+    }
 
 
 def _share_keys(
@@ -319,17 +387,29 @@ def _share_keys(
 ) -> dict[str, ConfigRecordValues]:
     """Handle the share-keys stage."""
     key_dict: dict[int, bytes] = {
-        int(sid): cast(bytes, pk) for sid, pk in configs.items() if sid != Key.STAGE
+        int(sid): cast(bytes, pk)
+        for sid, pk in configs.items()
+        if sid not in (Key.STAGE, Key.NEIGHBOUR_LIST)
     }
     state.public_keys_dict = key_dict
     log(DEBUG, "Node %d: SecAggPlusPlus stage 1 starts...", state.nid)
 
-    if len(state.public_keys_dict) < state.threshold:
+    # Round 1 sends the neighbours' public keys; later rounds send only the
+    # neighbour IDs because the pairwise secrets are already cached.
+    if key_dict:
+        neighbour_ids = list(key_dict.keys())
+    else:
+        neighbour_ids = [
+            int(nid) for nid in cast(list[Any], configs.get(Key.NEIGHBOUR_LIST, []))
+        ]
+
+    if len(neighbour_ids) < state.threshold:
         raise ValueError("Available neighbours number smaller than threshold")
 
-    own_pk = state.public_keys_dict[state.nid]
-    if own_pk != state.pk:
-        raise ValueError("Own public key is displayed in dict incorrectly")
+    if state.public_keys_dict:
+        own_pk = state.public_keys_dict[state.nid]
+        if own_pk != state.pk:
+            raise ValueError("Own public key is displayed in dict incorrectly")
 
     # Create Shamir shares of the master seeds.
     b_seed_shares = create_shares(state.b_seed, state.threshold, state.share_num)
@@ -337,8 +417,7 @@ def _share_keys(
 
     srcs, dsts, ciphertexts = [], [], []
 
-    # public_keys_dict ordering must be deterministic; configs is ordered.
-    for idx, (nid, pk) in enumerate(state.public_keys_dict.items()):
+    for idx, nid in enumerate(neighbour_ids):
         if nid == state.nid:
             # Keep our own shares locally (not used for masking, only for
             # reconstruction robustness).
@@ -354,11 +433,26 @@ def _share_keys(
         plaintext = share_keys_plaintext_concat_plus(
             state.nid, nid, k, b_seed_shares[idx], u_seed_shares[idx]
         )
-        ciphertext = pke_encrypt(pk, plaintext)
+
+        ad = _make_ad(state.nid, nid)
+        # Reuse an established pairwise secret after the first round.  Round 1
+        # uses ML-KEM+AEAD; later rounds use symmetric AEAD under the cached
+        # bidirectional secret.
+        if nid in state.pairwise_secrets:
+            inner = aead_encrypt(state.pairwise_secrets[nid], plaintext, ad)
+        else:
+            pk = state.public_keys_dict[nid]
+            shared_secret, kem_ciphertext = encapsulate(pk)
+            state.shared_secrets[nid] = shared_secret
+            sym_key = derive_share_encryption_key(shared_secret)
+            inner = kem_ciphertext + aead_encrypt(sym_key, plaintext, kem_ciphertext)
+
+        # Outer client-server onion layer.
+        outer = aead_encrypt(state.server_key, inner, ad)
 
         srcs.append(state.nid)
         dsts.append(nid)
-        ciphertexts.append(ciphertext)
+        ciphertexts.append(outer)
 
     log(DEBUG, "Node %d: SecAggPlusPlus stage 1 completes.", state.nid)
     return {
@@ -376,6 +470,7 @@ def _collect_masked_vectors(
 ) -> dict[str, ConfigRecordValues]:
     """Handle the collect-masked-vectors stage."""
     log(DEBUG, "Node %d: SecAggPlusPlus stage 2 starts...", state.nid)
+    _t0 = time.perf_counter()
 
     srcs = cast(list[int], configs[Key.SOURCE_LIST])
     ciphertexts = cast(list[bytes], configs[Key.CIPHERTEXT_LIST])
@@ -384,12 +479,37 @@ def _collect_masked_vectors(
         raise ValueError("Not enough available neighbour clients.")
 
     available_clients: list[int] = []
+    t_decrypt = 0.0
 
-    for src, ciphertext in zip(srcs, ciphertexts, strict=True):
+    for src, outer_ciphertext in zip(srcs, ciphertexts, strict=True):
         if src == state.nid:
-            # The server should not forward a self-message; skip if it does.
             continue
-        plaintext = pke_decrypt(state.sk, ciphertext)
+
+        _t1 = time.perf_counter()
+        ad = _make_ad(src, state.nid)
+        inner = aead_decrypt(state.server_key, outer_ciphertext, ad)
+
+        if src in state.pairwise_secrets:
+            plaintext = aead_decrypt(state.pairwise_secrets[src], inner, ad)
+        else:
+            kem_ciphertext = inner[:CIPHERTEXT_LEN]
+            sym_ciphertext = inner[CIPHERTEXT_LEN:]
+            reverse_secret = decapsulate_secret(kem_ciphertext, state.sk)
+            state.received_secrets[src] = reverse_secret
+            sym_key = derive_share_encryption_key(reverse_secret)
+            plaintext = aead_decrypt(sym_key, sym_ciphertext, kem_ciphertext)
+
+        if (
+            src not in state.pairwise_secrets
+            and src in state.shared_secrets
+            and src in state.received_secrets
+        ):
+            state.pairwise_secrets[src] = derive_pairwise_secret(
+                state.shared_secrets[src], state.received_secrets[src]
+            )
+        t_decrypt += time.perf_counter() - _t1
+
+        _t1 = time.perf_counter()
         actual_src, dst, k, b_share, u_share = share_keys_plaintext_separate_plus(
             plaintext
         )
@@ -407,8 +527,9 @@ def _collect_masked_vectors(
         state.received_keys[src] = k
         state.received_b_shares[src] = b_share
         state.received_u_shares[src] = u_share
+        t_decrypt += time.perf_counter() - _t1  # parse time
 
-    # Train / compute masked parameters.
+    _t_prep = time.perf_counter()
     ratio = num_examples / state.max_weight
     q_ratio = round(ratio * state.target_range)
     dq_ratio = q_ratio / state.target_range
@@ -420,40 +541,56 @@ def _collect_masked_vectors(
     )
     quantized_parameters = factor_combine(q_ratio, quantized_parameters)
 
-    # The leading array is the quantization factor; masks only apply to params.
     factor = quantized_parameters[0]
     param_arrays = quantized_parameters[1:]
 
     dimensions_list: list[tuple[int, ...]] = [a.shape for a in param_arrays]
     state.dimensions_list = dimensions_list
+    t_prep = time.perf_counter() - _t_prep
 
     def add_mask(target: NDArrays, key: bytes) -> NDArrays:
-        mask = pseudo_rand_gen(key, state.mod_range, dimensions_list)
+        mask = pseudo_rand_gen_secure(key, state.mod_range, dimensions_list)
         return parameters_addition(target, mask)
 
-    # Add received pairwise masks.
+    t_mask_rcv = 0.0
+    _t1 = time.perf_counter()
     received_mask_sum: NDArrays = [np.zeros_like(arr) for arr in param_arrays]
     for node_id in available_clients:
         received_mask_sum = add_mask(received_mask_sum, state.received_keys[node_id])
+    t_mask_rcv = time.perf_counter() - _t1
 
-    # Compute the sum of derived pairwise masks.
+    t_mask_der = 0.0
+    _t1 = time.perf_counter()
     derived_mask_sum: NDArrays = [np.zeros_like(arr) for arr in param_arrays]
     for node_id in state.derived_keys:
         derived_mask_sum = add_mask(derived_mask_sum, state.derived_keys[node_id])
+    t_mask_der = time.perf_counter() - _t1
 
-    # Add self mask.
-    self_mask = pseudo_rand_gen(state.u_seed, state.mod_range, dimensions_list)
-
-    # c_S = w_S + sum of received masks + u_S
+    _t1 = time.perf_counter()
+    self_mask = pseudo_rand_gen_secure(state.u_seed, state.mod_range, dimensions_list)
     c_params = parameters_addition(param_arrays, received_mask_sum)
     c_params = parameters_addition(c_params, self_mask)
     c_params = parameters_mod(c_params, state.mod_range)
     c_s = [factor] + c_params
 
-    # sum_S = sum of derived masks.  The factor slot is left as zero so that
-    # the quantization factors from each c_S still add up in the aggregate.
     sum_params = parameters_mod(derived_mask_sum, state.mod_range)
     sum_s = [np.zeros_like(factor)] + sum_params
+
+    t_combine = time.perf_counter() - _t1
+
+    t_total = time.perf_counter() - _t0
+    log(
+        INFO,
+        "Node %d: Stage2 timing total=%.4fs decrypt=%.4fs prep=%.4fs "
+        "mask_rcv=%.4fs mask_der=%.4fs combine=%.4fs",
+        state.nid,
+        t_total,
+        t_decrypt,
+        t_prep,
+        t_mask_rcv,
+        t_mask_der,
+        t_combine,
+    )
 
     log(DEBUG, "Node %d: SecAggPlusPlus stage 2 completes.", state.nid)
     return {
@@ -467,6 +604,7 @@ def _unmask(
 ) -> dict[str, ConfigRecordValues]:
     """Handle the unmask stage."""
     log(DEBUG, "Node %d: SecAggPlusPlus stage 3 starts...", state.nid)
+    _t0 = time.perf_counter()
 
     active_nids = cast(list[int], configs[Key.ACTIVE_NODE_ID_LIST])
     dead_nids = cast(list[int], configs[Key.DEAD_NODE_ID_LIST])
@@ -474,20 +612,10 @@ def _unmask(
     if len(active_nids) < state.threshold:
         raise ValueError("Available neighbours number smaller than threshold")
 
-    # The server knows which clients sent a masked vector (active_nids) and
-    # which dropped before that stage (dead_nids).  The client trusts these
-    # lists: active clients need u_seed shares, dead clients need b_seed shares.
-
-    # Build the ordered list of clients whose shares we upload:
-    # - active clients first (u_seed shares, so the server can reconstruct
-    #   every self mask from threshold shares rather than receiving it directly)
-    # - dead clients second (b_seed shares, for pairwise-mask recovery)
     share_nids = active_nids + dead_nids
     shares: list[bytes] = []
     for nid in share_nids:
         if nid in active_nids:
-            # Our own u_seed share is stored in u_seed_shares; shares for other
-            # active clients were received during masked-vector collection.
             if nid == state.nid:
                 shares.append(state.u_seed_shares[nid])
             else:
@@ -495,16 +623,26 @@ def _unmask(
         else:
             shares.append(state.received_b_shares[nid])
 
-    # Compute e_S = sum of masks derived by this client for dead neighbours.
-    # These cancel the -k_{S->D} terms that remain in sum_S.
+    _t1 = time.perf_counter()
     e_s: NDArrays = [np.zeros(shape, dtype=np.int64) for shape in state.dimensions_list]
     for nid in dead_nids:
         if nid in state.derived_keys:
-            mask = pseudo_rand_gen(
+            mask = pseudo_rand_gen_secure(
                 state.derived_keys[nid], state.mod_range, state.dimensions_list
             )
             e_s = parameters_addition(e_s, mask)
     e_s = parameters_mod(e_s, state.mod_range)
+    t_e = time.perf_counter() - _t1
+
+    t_total = time.perf_counter() - _t0
+    log(
+        INFO,
+        "Node %d: Stage3 timing total=%.4fs e_S=%.4fs n_dead=%d",
+        state.nid,
+        t_total,
+        t_e,
+        len(dead_nids),
+    )
 
     log(DEBUG, "Node %d: SecAggPlusPlus stage 3 completes.", state.nid)
     return {

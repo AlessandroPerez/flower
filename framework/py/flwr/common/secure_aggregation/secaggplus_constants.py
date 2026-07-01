@@ -44,6 +44,7 @@ class Key:
     """Keys for the configs in the ConfigRecord."""
 
     STAGE = "stage"
+    NEIGHBOUR_LIST = "neighbour_list"
     SAMPLE_NUMBER = "sample_num"
     SHARE_NUMBER = "share_num"
     THRESHOLD = "threshold"
@@ -55,6 +56,7 @@ class Key:
     PUBLIC_KEY_2 = "pk2"
     PUBLIC_KEY_PAIRWISE = "pk_pairwise"
     PUBLIC_KEY_SHARE_ENC = "pk_share_enc"
+    SERVER_KEY = "server_key"
     SINGLE_KEM = "single_kem"
     DESTINATION_LIST = "dsts"
     CIPHERTEXT_LIST = "ctxts"

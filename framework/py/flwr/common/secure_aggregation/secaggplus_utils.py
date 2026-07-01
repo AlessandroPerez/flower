@@ -163,15 +163,80 @@ def pseudo_rand_gen(
 
 
 def derive_pairwise_key(seed: bytes, n_id: int) -> bytes:
-    """Derive a pairwise key from a master seed and a neighbour node ID.
+    """Derive a 256-bit pairwise key from a master seed and a neighbour node ID.
 
     The derivation matches the SecAggPlusPlus design:
-    ``Hash(seed || encoding(n_id))`` where ``encoding(n_id)`` is the 32-byte
-    little-endian representation of the node ID.
+    ``SHA3-256(seed || encoding(n_id))`` where ``encoding(n_id)`` is the
+    32-byte little-endian representation of the node ID.
     """
-    import hashlib
+    from hashlib import sha3_256
 
-    return hashlib.sha256(seed + int.to_bytes(n_id, 32, "little")).digest()
+    return sha3_256(seed + int.to_bytes(n_id, 32, "little")).digest()
+
+
+def pseudo_rand_gen_secure(
+    seed: bytes, num_range: int, dimensions_list: list[tuple[int, ...]]
+) -> list[NDArrayInt]:
+    """Cryptographically secure seeded pseudo-random mask generator.
+
+    This is the SecAgg++-specific variant of :func:`pseudo_rand_gen`.  Each
+    output element is produced from ``ceil(log2(num_range)) + 128`` bits of a
+    SHAKE256 XOF stream keyed by ``seed``, then reduced modulo ``num_range``.
+    The extra 128 bits of margin keep the modular-reduction bias negligible
+    even when ``num_range`` is not a power of two.
+
+    Parameters
+    ----------
+    seed : bytes
+        Seed for the generator.
+    num_range : int
+        Upper bound (exclusive) of each generated value.
+    dimensions_list : list[tuple[int, ...]]
+        Shape of each output array.
+
+    Returns
+    -------
+    list[NDArrayInt]
+        A list of pseudo-random integer arrays matching ``dimensions_list``.
+    """
+    from cryptography.hazmat.primitives.hashes import SHAKE256, Hash
+
+    if num_range <= 0:
+        raise ValueError("`num_range` must be positive.")
+
+    total_elements = sum(int(np.prod(dim)) if dim else 1 for dim in dimensions_list)
+    if total_elements == 0:
+        return []
+
+    # Each mask value must be sampled from ceil(log2(num_range)) + 128 bits
+    # of randomness before reduction modulo num_range, as specified in the
+    # SecAgg++ design document.
+    bits_per_value = num_range.bit_length() + 128
+    bytes_per_value = (bits_per_value + 7) // 8
+
+    total_bytes = total_elements * bytes_per_value
+    xof = Hash(SHAKE256(digest_size=total_bytes))
+    xof.update(seed)
+    random_bytes = np.frombuffer(xof.finalize(), dtype=np.uint8).reshape(
+        total_elements, bytes_per_value
+    )
+
+    # Convert big-endian byte chunks to integers and reduce mod num_range.
+    ints = np.zeros(total_elements, dtype=np.int64)
+    for i in range(bytes_per_value):
+        ints = ((ints << 8) + random_bytes[:, i].astype(np.int64)) % num_range
+
+    output: list[NDArrayInt] = []
+    offset = 0
+    for dim in dimensions_list:
+        n = int(np.prod(dim)) if dim else 1
+        arr = ints[offset : offset + n]
+        if dim:
+            arr = arr.reshape(dim)
+        output.append(arr)
+        offset += n
+
+    return output
 
 
 def share_keys_plaintext_concat_plus(

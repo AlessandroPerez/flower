@@ -9,8 +9,8 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-JSON_PATH = Path("speed_tests/flower_secagg_mnist_benchmark.json")
-OUT_DIR = Path("speed_tests")
+JSON_PATH = Path(__file__).resolve().parent / "flower_secagg_mnist_benchmark.json"
+OUT_DIR = Path(__file__).resolve().parent
 
 
 def _load_data() -> list[dict[str, Any]]:
@@ -41,9 +41,9 @@ def _plot_metric(
     """Create a 2x2 subplot grid, one panel per dropout rate."""
     rates = sorted({key[1] for key in grouped})
     ns = sorted({key[0] for key in grouped})
-    impls = ("classical", "pq_single")
-    colors = {"classical": "tab:blue", "pq_single": "tab:orange"}
-    markers = {"classical": "o", "pq_single": "s"}
+    impls = ("classical", "secaggplusplus")
+    colors = {"classical": "tab:blue", "secaggplusplus": "tab:orange"}
+    markers = {"classical": "o", "secaggplusplus": "s"}
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharex=True, sharey=True)
     axes = axes.flatten()
@@ -87,7 +87,7 @@ def _plot_accuracy_heatmap(
     """Create heatmaps of final accuracy for each implementation."""
     rates = sorted({key[1] for key in grouped})
     ns = sorted({key[0] for key in grouped})
-    impls = ("classical", "pq_single")
+    impls = ("classical", "secaggplusplus")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for ax, impl in zip(axes, impls, strict=True):

@@ -18,6 +18,7 @@
 import random
 from dataclasses import dataclass, field
 from logging import DEBUG, ERROR, INFO, WARN
+from time import perf_counter
 from typing import cast
 
 import flwr.compat.common.recorddict_compat as compat
@@ -75,6 +76,7 @@ class WorkflowState:  # pylint: disable=R0902
     aggregate_ndarrays: NDArrays = field(default_factory=list)
     legacy_results: list[tuple[ClientProxy, FitRes]] = field(default_factory=list)
     failures: list[Exception] = field(default_factory=list)
+    timing_log: dict[str, float] = field(default_factory=dict)
 
 
 class SecAggPlusWorkflow:
@@ -186,19 +188,28 @@ class SecAggPlusWorkflow:
                 f"Expect a LegacyContext, but get {type(context).__name__}."
             )
         state = WorkflowState()
+        state.timing_log: dict[str, float] = {}
 
+        cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+        round_num = cast(int, cfg[WorkflowKey.CURRENT_ROUND])
         steps = (
-            self.setup_stage,
-            self.share_keys_stage,
-            self.collect_masked_vectors_stage,
-            self.unmask_stage,
+            ("Setup", self.setup_stage),
+            ("ShareKeys", self.share_keys_stage),
+            ("CollectMasked", self.collect_masked_vectors_stage),
+            ("Unmask", self.unmask_stage),
         )
-        log(INFO, "Secure aggregation commencing.")
-        for step in steps:
-            if not step(grid, context, state):
-                log(INFO, "Secure aggregation halted.")
+        _call_t0 = perf_counter()
+        log(INFO, "Classical SecAgg+ commencing round %s.", round_num)
+        for name, step in steps:
+            t0 = perf_counter()
+            ok = step(grid, context, state)
+            state.timing_log[name] = perf_counter() - t0
+            if not ok:
+                log(INFO, "Classical SecAgg+ halted.")
                 return
-        log(INFO, "Secure aggregation completed.")
+        _call_elapsed = perf_counter() - _call_t0
+        log(INFO, "Classical timing round %s: total=%.4fs stages=%s",
+            round_num, _call_elapsed, state.timing_log)
 
     def _check_init_params(self) -> None:  # pylint: disable=R0912
         # Check `num_shares`
@@ -323,6 +334,17 @@ class SecAggPlusWorkflow:
             state.threshold = max(state.threshold, 2)
         else:
             state.threshold = self.reconstruction_threshold
+
+        # The number of shares should better be odd in the SecAgg+ protocol.
+        if num_samples != state.num_shares and state.num_shares & 1 == 0:
+            log(WARN, "Number of shares in the SecAgg+ protocol should be odd.")
+            state.num_shares += 1
+            if isinstance(self.reconstruction_threshold, float):
+                state.threshold = round(
+                    self.reconstruction_threshold * state.num_shares
+                )
+                state.threshold = max(state.threshold, 2)
+
         state.active_node_ids = set(sampled_node_ids)
         state.clipping_range = self.clipping_range
         state.quantization_range = self.quantization_range
@@ -338,11 +360,6 @@ class SecAggPlusWorkflow:
             Key.MOD_RANGE: state.mod_range,
             Key.MAX_WEIGHT: state.max_weight,
         }
-
-        # The number of shares should better be odd in the SecAgg+ protocol.
-        if num_samples != state.num_shares and state.num_shares & 1 == 0:
-            log(WARN, "Number of shares in the SecAgg+ protocol should be odd.")
-            state.num_shares += 1
 
         # Shuffle node IDs
         random.shuffle(sampled_node_ids)

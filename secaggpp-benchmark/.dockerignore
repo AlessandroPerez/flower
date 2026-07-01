@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Python virtual environments
+.venv
+.secagg-bench-venvs
+framework/.venv
+
+# Build artifacts and caches
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.tox
+
+# Documentation
+docs/build
+
+# IDE
+.vscode
+.idea
+
+# Misc
+*.log
+.DS_Store

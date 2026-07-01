@@ -18,6 +18,7 @@ import random
 import time
 import uuid
 from collections.abc import Callable, Iterable
+from math import ceil, log2
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +27,7 @@ from flwr.app import Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.client.mod import make_ffn
 from flwr.client.mod.secure_aggregation.secaggplus_mod import secaggplus_mod
-from flwr.client.mod.secure_aggregation.secaggplus_plus_mod import (
-    secaggplus_plus_mod,
-)
+from flwr.client.mod.secure_aggregation.secaggplus_plus_mod import secaggplus_plus_mod
 from flwr.common import (
     Code,
     FitRes,
@@ -37,9 +36,6 @@ from flwr.common import (
     ndarray_to_bytes,
     ndarrays_to_parameters,
     parameters_to_ndarrays,
-)
-from flwr.common.secure_aggregation.crypto.degree_threshold import (
-    compute_degree_and_threshold,
 )
 from flwr.common.secure_aggregation.secaggplus_constants import (
     RECORD_KEY_CONFIGS as SECAGG_RECORD_KEY_CONFIGS,
@@ -70,12 +66,6 @@ RUNS_PER_CONFIG: int = 1
 NUM_FEATURES: int = 100_000
 NUM_EXAMPLES_PER_CLIENT: int = 100
 LEARNING_RATE: float = 0.01
-
-# Security / graph parameters for adaptive degree computation.
-GAMMA: float = 0.01
-DELTA: float = 0.01
-SIGMA: int = 20
-ETA: int = 20
 
 # Output directory (relative to this script).
 OUT_DIR = Path(__file__).resolve().parent
@@ -334,12 +324,11 @@ def _log_counts(max_n: int) -> list[int]:
 
 
 def _degree_threshold_with_fallback(n: int, dropout_rate: float) -> tuple[int, int]:
-    """Return adaptive (k, t); fall back to a complete graph if needed."""
-    try:
-        return compute_degree_and_threshold(n, GAMMA, dropout_rate, SIGMA, ETA)
-    except ValueError:
-        active = max(2, n - int(round(n * dropout_rate)))
-        return n, max(2, active - 1)
+    """Return a log-spaced degree and a dropout-tolerant threshold."""
+    degree = min(n, 2 * ceil(log2(n)) + 1)
+    active = max(2, n - int(round(n * dropout_rate)))
+    threshold = min(max(2, active - 1), degree - 1)
+    return degree, threshold
 
 
 def _make_workflow(
@@ -360,10 +349,6 @@ def _make_workflow(
         return SecAggPlusPlusWorkflow(
             num_shares=k,
             reconstruction_threshold=t,
-            gamma=GAMMA,
-            delta=dropout_rate,
-            sigma=SIGMA,
-            eta=ETA,
             max_weight=float(NUM_EXAMPLES_PER_CLIENT * 2),
             clipping_range=10.0,
             quantization_range=2**20,

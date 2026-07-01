@@ -1,0 +1,10 @@
+# Benchmark local artifacts
+.secagg-bench-venvs/
+__pycache__/
+*.pyc
+.venv/
+
+# Generated results (keep sample JSONs/PNGs in git, ignore transient files)
+results.csv
+scaling_sparse.png
+*.log

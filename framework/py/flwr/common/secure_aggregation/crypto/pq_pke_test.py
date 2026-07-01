@@ -16,13 +16,13 @@
 
 
 import pytest
-from cryptography.fernet import InvalidToken
+from cryptography.exceptions import InvalidTag
 
-from .pq_pke import decrypt, encrypt, generate_keypair
+from .pq_pke import aead_decrypt, aead_encrypt, decrypt, encrypt, generate_keypair
 
 
 class TestPQPKE:
-    """Tests for the X-Wing + Fernet PKE wrapper."""
+    """Tests for the ML-KEM-768 + AES-GCM PKE wrapper."""
 
     def test_keypair_generation(self) -> None:
         """Generated keys are non-empty and distinct."""
@@ -63,5 +63,20 @@ class TestPQPKE:
         public_key, _ = generate_keypair()
         _, wrong_secret_key = generate_keypair()
         ciphertext = encrypt(public_key, b"secret")
-        with pytest.raises(InvalidToken):
+        with pytest.raises(InvalidTag):
             decrypt(wrong_secret_key, ciphertext)
+
+    def test_aead_roundtrip(self) -> None:
+        """AEAD encrypt/decrypt roundtrip with associated data."""
+        key = b"0" * 32
+        ad = b"associated"
+        plaintext = b"hello"
+        ciphertext = aead_encrypt(key, plaintext, ad)
+        assert aead_decrypt(key, ciphertext, ad) == plaintext
+
+    def test_aead_wrong_ad_fails(self) -> None:
+        """AEAD decryption fails if associated data does not match."""
+        key = b"0" * 32
+        ciphertext = aead_encrypt(key, b"hello", b"right-ad")
+        with pytest.raises(InvalidTag):
+            aead_decrypt(key, ciphertext, b"wrong-ad")

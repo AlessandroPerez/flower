@@ -48,7 +48,7 @@ class TestDerivePairwiseKey:
         assert k1 != k2
 
     def test_output_is_32_bytes(self) -> None:
-        """The derived key is a SHA-256 digest."""
+        """The derived key is a 256-bit digest."""
         k = derive_pairwise_key(b"seed", 0)
         assert len(k) == 32
 

@@ -16,8 +16,9 @@
 
 
 import os
+import time
 from dataclasses import dataclass, field
-from logging import DEBUG, WARNING
+from logging import DEBUG, INFO, WARNING
 from typing import Any, cast
 
 from flwr.app import ConfigRecord, Context, Message, RecordDict
@@ -164,12 +165,18 @@ def secaggplus_mod(
     elif state.current_stage == Stage.SHARE_KEYS:
         res = _share_keys(state, configs)
     elif state.current_stage == Stage.COLLECT_MASKED_VECTORS:
+        _ct = time.perf_counter()
         out_msg = call_next(msg, ctxt)
+        _call_next_t = time.perf_counter() - _ct
         out_content = out_msg.content
         fitres = compat.recorddict_to_fitres(out_content, keep_input=True)
+        _ct = time.perf_counter()
         res = _collect_masked_vectors(
             state, configs, fitres.num_examples, fitres.parameters
         )
+        _mask_t = time.perf_counter() - _ct
+        log(INFO, "Node %d: classical collect_masked: call_next=%.4fs mask=%.4fs",
+            state.nid, _call_next_t, _mask_t)
         for arr_record in out_content.array_records.values():
             arr_record.clear()
     elif state.current_stage == Stage.UNMASK:

@@ -17,18 +17,15 @@
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass, field
-from logging import DEBUG, ERROR, INFO
-from typing import cast
+from logging import DEBUG, ERROR, INFO, WARN
+from time import perf_counter
+from typing import Any, cast
 
 import flwr.compat.common.recorddict_compat as compat
 from flwr.app import ConfigRecord, Context, Message, RecordDict
 from flwr.app.message_type import MessageType
 from flwr.common import FitRes, NDArrays, bytes_to_ndarray, log, ndarrays_to_parameters
-from flwr.common.secure_aggregation.crypto.degree_threshold import (
-    compute_degree_and_threshold,
-)
 from flwr.common.secure_aggregation.crypto.shamir import combine_shares
 from flwr.common.secure_aggregation.ndarrays_arithmetic import (
     factor_extract,
@@ -45,7 +42,7 @@ from flwr.common.secure_aggregation.secaggplus_constants import (
 )
 from flwr.common.secure_aggregation.secaggplus_utils import (
     derive_pairwise_key,
-    pseudo_rand_gen,
+    pseudo_rand_gen_secure,
 )
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.compat.legacy_context import LegacyContext
@@ -53,6 +50,13 @@ from flwr.serverapp.grid import Grid
 
 from ..constant import MAIN_CONFIGS_RECORD, MAIN_PARAMS_RECORD
 from ..constant import Key as WorkflowKey
+
+
+def _make_ad(src_node_id: int, dst_node_id: int) -> bytes:
+    """Encode (source, destination) as AEAD associated data."""
+    return int.to_bytes(src_node_id, 8, "little", signed=False) + int.to_bytes(
+        dst_node_id, 8, "little", signed=False
+    )
 
 
 @dataclass
@@ -71,6 +75,7 @@ class WorkflowState:  # pylint: disable=R0902
     max_weight: float = 0.0
     nid_to_neighbours: dict[int, set[int]] = field(default_factory=dict)
     nid_to_publickeys: dict[int, bytes] = field(default_factory=dict)
+    nid_to_serverkeys: dict[int, bytes] = field(default_factory=dict)
     forward_srcs: dict[int, list[int]] = field(default_factory=dict)
     forward_ciphertexts: dict[int, list[bytes]] = field(default_factory=dict)
     aggregate_ndarrays: NDArrays = field(default_factory=list)
@@ -78,6 +83,7 @@ class WorkflowState:  # pylint: disable=R0902
     masked_params: dict[int, NDArrays] = field(default_factory=dict)
     legacy_results: list[tuple[ClientProxy, FitRes]] = field(default_factory=list)
     failures: list[Exception] = field(default_factory=list)
+    timing_log: dict[str, float] = field(default_factory=dict)
 
 
 class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
@@ -91,13 +97,9 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
 
     def __init__(  # pylint: disable=R0913
         self,
-        num_shares: int | float | None = None,
-        reconstruction_threshold: int | float | None = None,
+        num_shares: int | float,
+        reconstruction_threshold: int | float,
         *,
-        gamma: float = 0.2,
-        delta: float = 0.2,
-        sigma: int = 40,
-        eta: int = 30,
         max_weight: float = 1000.0,
         clipping_range: float = 8.0,
         quantization_range: int = 4194304,
@@ -106,10 +108,6 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
     ) -> None:
         self.num_shares = num_shares
         self.reconstruction_threshold = reconstruction_threshold
-        self.gamma = gamma
-        self.delta = delta
-        self.sigma = sigma
-        self.eta = eta
         self.max_weight = max_weight
         self.clipping_range = clipping_range
         self.quantization_range = quantization_range
@@ -125,71 +123,93 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
                 f"Expect a LegacyContext, but get {type(context).__name__}."
             )
         state = WorkflowState()
+        state.timing_log: dict[str, float] = {}
 
         steps = (
-            self.setup_stage,
-            self.share_keys_stage,
-            self.collect_masked_vectors_stage,
-            self.unmask_stage,
+            ("Setup", self.setup_stage),
+            ("ShareKeys", self.share_keys_stage),
+            ("CollectMasked", self.collect_masked_vectors_stage),
+            ("Unmask", self.unmask_stage),
         )
-        log(INFO, "SecAggPlusPlus secure aggregation commencing.")
-        for step in steps:
-            if not step(grid, context, state):
+        round_num = cast(
+            int,
+            context.state.config_records[MAIN_CONFIGS_RECORD][
+                WorkflowKey.CURRENT_ROUND
+            ],
+        )
+        _call_t0 = perf_counter()
+        log(INFO, "SecAggPlusPlus secure aggregation commencing (round %s).", round_num)
+        for name, step in steps:
+            t0 = perf_counter()
+            ok = step(grid, context, state)
+            state.timing_log[name] = perf_counter() - t0
+            if not ok:
                 log(INFO, "SecAggPlusPlus secure aggregation halted.")
                 return
-        log(INFO, "SecAggPlusPlus secure aggregation completed.")
+        _call_elapsed = perf_counter() - _call_t0
+        log(
+            INFO,
+            "SecAggPlusPlus timing round %s: total=%.4fs stages=%s",
+            round_num,
+            _call_elapsed,
+            state.timing_log,
+        )
 
     def _check_init_params(self) -> None:  # pylint: disable=R0912
-        if self.num_shares is not None and not isinstance(
-            self.num_shares, (int | float)
-        ):
-            raise TypeError("`num_shares` must be of type int, float, or None.")
-        if isinstance(self.num_shares, int) and self.num_shares <= 2:
-            raise ValueError("`num_shares` as an integer must be greater than 2.")
-        if isinstance(self.num_shares, float) and not 0.0 < self.num_shares <= 1.0:
-            raise ValueError("If `num_shares` is a float, it must be in (0, 1].")
+        # Check `num_shares`
+        if not isinstance(self.num_shares, (int | float)):
+            raise TypeError("`num_shares` must be of type int or float.")
+        if isinstance(self.num_shares, int):
+            if self.num_shares == 1:
+                self.num_shares = 1.0
+            elif self.num_shares <= 2:
+                raise ValueError("`num_shares` as an integer must be greater than 2.")
+            elif self.num_shares > self.modulus_range / self.quantization_range:
+                log(
+                    WARN,
+                    "A `num_shares` larger than `modulus_range / quantization_range` "
+                    "will potentially cause overflow when computing the aggregated "
+                    "model parameters.",
+                )
+        elif self.num_shares <= 0:
+            raise ValueError("`num_shares` as a float must be greater than 0.")
 
-        if self.reconstruction_threshold is not None and not isinstance(
-            self.reconstruction_threshold, (int | float)
-        ):
-            raise TypeError(
-                "`reconstruction_threshold` must be of type int, float, or None."
-            )
-        if (
-            isinstance(self.reconstruction_threshold, int)
-            and self.reconstruction_threshold < 1
-        ):
-            raise ValueError(
-                "`reconstruction_threshold` as an integer must be at least 1."
-            )
-        if (
-            isinstance(self.reconstruction_threshold, float)
-            and not 0.0 < self.reconstruction_threshold <= 1.0
-        ):
-            raise ValueError(
-                "If `reconstruction_threshold` is a float, it must be in (0, 1]."
-            )
+        # Check `reconstruction_threshold`
+        if not isinstance(self.reconstruction_threshold, (int | float)):
+            raise TypeError("`reconstruction_threshold` must be of type int or float.")
+        if isinstance(self.reconstruction_threshold, int):
+            if self.reconstruction_threshold == 1:
+                self.reconstruction_threshold = 1.0
+            elif isinstance(self.num_shares, int):
+                if self.reconstruction_threshold >= self.num_shares:
+                    raise ValueError(
+                        "`reconstruction_threshold` must be less than `num_shares`."
+                    )
+        else:
+            if not 0 < self.reconstruction_threshold <= 1:
+                raise ValueError(
+                    "If `reconstruction_threshold` is a float, "
+                    "it must be greater than 0 and less than or equal to 1."
+                )
 
-        if not 0.0 <= self.gamma < 1.0:
-            raise ValueError("`gamma` must be in [0, 1).")
-        if not 0.0 <= self.delta < 1.0:
-            raise ValueError("`delta` must be in [0, 1).")
-        if self.gamma + self.delta >= 1.0:
-            raise ValueError("`gamma + delta` must be < 1.")
-        if self.sigma <= 0 or self.eta <= 0:
-            raise ValueError("`sigma` and `eta` must be positive.")
-
+        # Check `max_weight`
         if self.max_weight <= 0:
             raise ValueError("`max_weight` must be greater than 0.")
-        if self.quantization_range <= 0:
-            raise ValueError("`quantization_range` must be greater than 0.")
+
+        # Check `quantization_range`
+        if not isinstance(self.quantization_range, int) or self.quantization_range <= 0:
+            raise ValueError(
+                "`quantization_range` must be an integer and greater than 0."
+            )
+
+        # Check `modulus_range`
         if (
             not isinstance(self.modulus_range, int)
             or self.modulus_range <= self.quantization_range
         ):
             raise ValueError(
-                "`modulus_range` must be an integer and greater than "
-                "`quantization_range`."
+                "`modulus_range` must be an integer and "
+                "greater than `quantization_range`."
             )
         if bin(self.modulus_range).count("1") != 1:
             raise ValueError("`modulus_range` must be a power of 2.")
@@ -237,33 +257,21 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
             log(ERROR, "The number of samples should be greater than 1.")
             return False
 
-        if self.num_shares is None:
-            k_adaptive, t_adaptive = compute_degree_and_threshold(
-                num_samples, self.gamma, self.delta, self.sigma, self.eta
-            )
-            state.num_shares = k_adaptive
-            state.threshold = t_adaptive
+        if isinstance(self.num_shares, float):
+            state.num_shares = round(self.num_shares * num_samples)
+            if state.num_shares < num_samples and state.num_shares & 1 == 0:
+                state.num_shares += 1
+            if state.num_shares <= 2:
+                state.num_shares = num_samples
         else:
-            if isinstance(self.num_shares, float):
-                state.num_shares = round(self.num_shares * num_samples)
-                if state.num_shares < num_samples and state.num_shares & 1 == 0:
-                    state.num_shares += 1
-                if state.num_shares <= 2:
-                    state.num_shares = num_samples
-            else:
-                state.num_shares = self.num_shares
+            state.num_shares = self.num_shares
 
-            if self.reconstruction_threshold is None:
-                raise ValueError(
-                    "`reconstruction_threshold` must be provided when "
-                    "`num_shares` is explicit."
-                )
-            if isinstance(self.reconstruction_threshold, float):
-                state.threshold = max(
-                    2, round(self.reconstruction_threshold * state.num_shares)
-                )
-            else:
-                state.threshold = self.reconstruction_threshold
+        if isinstance(self.reconstruction_threshold, float):
+            state.threshold = max(
+                2, round(self.reconstruction_threshold * state.num_shares)
+            )
+        else:
+            state.threshold = self.reconstruction_threshold
 
         state.num_shares = min(state.num_shares, num_samples)
         state.num_shares = min(num_samples, max(state.num_shares, 3))
@@ -289,7 +297,10 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
             Key.MAX_WEIGHT: self.max_weight,
         }
 
-        random.shuffle(sampled_node_ids)
+        # Use a deterministic ordering so the neighbour graph is stable across
+        # rounds.  This lets clients reuse the ML-KEM pairwise secrets they
+        # establish in round 1 instead of re-running the KEM every round.
+        sampled_node_ids = sorted(sampled_node_ids)
         half_share = state.num_shares >> 1
         state.nid_to_neighbours = {
             nid: {
@@ -337,7 +348,9 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
             key_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
             node_id = msg.metadata.src_node_id
             pk = cast(bytes, key_dict[Key.PUBLIC_KEY_PAIRWISE])
+            server_key = cast(bytes, key_dict[Key.SERVER_KEY])
             state.nid_to_publickeys[node_id] = pk
+            state.nid_to_serverkeys[node_id] = server_key
 
         return self._check_threshold(state)
 
@@ -346,19 +359,27 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
     ) -> bool:
         """Execute the 'share keys' stage (stage 1)."""
         cfg = context.state.config_records[MAIN_CONFIGS_RECORD]
+        current_round = cast(int, cfg[WorkflowKey.CURRENT_ROUND])
+        # Public keys only need to be distributed in round 1; afterwards clients
+        # reuse the cached ML-KEM pairwise secrets.
+        first_round = current_round == 1
 
         def make(nid: int) -> Message:
             neighbours = state.nid_to_neighbours[nid] & state.active_node_ids
-            cfg_record = ConfigRecord(
-                {str(nid): state.nid_to_publickeys[nid] for nid in neighbours}
-            )
-            cfg_record[Key.STAGE] = Stage.SHARE_KEYS
+            cfg_dict: dict[str, Any] = {Key.STAGE: Stage.SHARE_KEYS}
+            if first_round:
+                cfg_dict.update(
+                    {str(nid): state.nid_to_publickeys[nid] for nid in neighbours}
+                )
+            else:
+                cfg_dict[Key.NEIGHBOUR_LIST] = list(neighbours)
+            cfg_record = ConfigRecord(cfg_dict)
             content = RecordDict({RECORD_KEY_CONFIGS: cfg_record})
             return Message(
                 content=content,
                 dst_node_id=nid,
                 message_type=MessageType.TRAIN,
-                group_id=str(cfg[WorkflowKey.CURRENT_ROUND]),
+                group_id=str(current_round),
             )
 
         log(
@@ -403,7 +424,10 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
 
         for src, dst, ciphertext in zip(srcs, dsts, ciphertexts, strict=True):
             if dst in fwd_ciphertexts:
-                fwd_ciphertexts[dst].append(ciphertext)
+                ad = _make_ad(src, dst)
+                inner = aead_decrypt(state.nid_to_serverkeys[src], ciphertext, ad)
+                rewrapped = aead_encrypt(state.nid_to_serverkeys[dst], inner, ad)
+                fwd_ciphertexts[dst].append(rewrapped)
                 fwd_srcs[dst].append(src)
 
         state.forward_srcs = fwd_srcs
@@ -453,23 +477,29 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
         del state.forward_srcs, state.forward_ciphertexts, state.nid_to_fitins
 
         aggregate: NDArrays | None = None
+        t_deser = 0.0
+        t_sum = 0.0
         for msg in msgs:
             if msg.has_error():
                 state.failures.append(Exception(msg.error))
                 continue
+            t0 = perf_counter()
             res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
             bytes_list = cast(list[bytes], res_dict[Key.MASKED_PARAMETERS])
             c_s = [bytes_to_ndarray(b) for b in bytes_list]
             sum_s_bytes = cast(list[bytes], res_dict[Key.SUM_DERIVED_KEYS])
             sum_s = [bytes_to_ndarray(b) for b in sum_s_bytes]
+            t_deser += perf_counter() - t0
 
             state.masked_params[msg.metadata.src_node_id] = c_s
             state.sum_derived[msg.metadata.src_node_id] = sum_s
 
+            t0 = perf_counter()
             if aggregate is None:
                 aggregate = c_s
             else:
                 aggregate = parameters_addition(aggregate, c_s)
+            t_sum += perf_counter() - t0
 
             # Backward compatibility with Strategy.
             fitres = compat.recorddict_to_fitres(msg.content, True)
@@ -480,11 +510,16 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
             log(ERROR, "No masked vectors received.")
             return False
 
+        t0 = perf_counter()
         # Subtract all sum_S vectors.
         for sum_s in state.sum_derived.values():
             aggregate = parameters_subtraction(aggregate, sum_s)
+        t_sub = perf_counter() - t0
 
         aggregate = parameters_mod(aggregate, state.mod_range)
+        state.timing_log["Stage2_deser"] = t_deser
+        state.timing_log["Stage2_sum"] = t_sum
+        state.timing_log["Stage2_sub"] = t_sub
         state.aggregate_ndarrays = aggregate
 
         return self._check_threshold(state)
@@ -564,6 +599,7 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
         b_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in stage2_dead}
         u_seed_shares: dict[int, list[bytes]] = {nid: [] for nid in p2_clients}
 
+        t_sharepile = 0.0
         for msg in msgs:
             if msg.has_error():
                 state.failures.append(Exception(msg.error))
@@ -590,6 +626,8 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
 
         # Cancel outgoing masks from each stage-2 dropped client to surviving
         # clients.
+        t_dead_cancel = 0.0
+        t_dead_combine = 0.0
         for dead_nid in stage2_dead:
             share_list = b_seed_shares[dead_nid]
             if len(share_list) < state.threshold:
@@ -599,30 +637,51 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
                     dead_nid,
                 )
                 return False
+            t0 = perf_counter()
             b_seed = combine_shares(share_list)
-
+            mid = perf_counter()
             for survivor_nid in state.nid_to_neighbours[dead_nid] & p2_clients:
                 k = derive_pairwise_key(b_seed, survivor_nid)
-                mask = pseudo_rand_gen(k, state.mod_range, param_dimensions)
+                mask = pseudo_rand_gen_secure(k, state.mod_range, param_dimensions)
                 params = parameters_subtraction(params, mask)
+            t1 = perf_counter()
+            t_dead_combine += mid - t0
+            t_dead_cancel += t1 - t0
+        if stage2_dead:
+            log(
+                INFO,
+                "Stage3 dead_cancel: combine=%.4fs prg+sub=%.4fs total=%.4fs n_dead=%d",
+                t_dead_combine,
+                t_dead_cancel - t_dead_combine,
+                t_dead_cancel,
+                len(stage2_dead),
+            )
 
         # Cancel incoming masks from surviving clients to stage-2 dropped
         # clients. Each surviving client sends e_S as a vector sum.
+        t_e_add = 0.0
         for msg in msgs:
             if msg.has_error():
                 continue
+            t0 = perf_counter()
             res_dict = msg.content.config_records[RECORD_KEY_CONFIGS]
             e_lst = cast(list[bytes], res_dict[Key.E_VALUE])
             e_sum = [bytes_to_ndarray(b) for b in e_lst]
             params = parameters_addition(params, e_sum)
+            t_e_add += perf_counter() - t0
 
         params = parameters_mod(params, state.mod_range)
 
         # Remove self masks for all clients whose c_S is in the aggregate.
         # Every u_seed is reconstructed from threshold shares, matching the
         # privacy model of classical SecAgg+.
+        t_self_unmask = 0.0
+        t_combine_shares = 0.0
+        t_prg_and_sub = 0.0
+        share_counts = set()
         for nid in p2_clients:
             share_list = u_seed_shares[nid]
+            share_counts.add(len(share_list))
             if len(share_list) < state.threshold:
                 log(
                     ERROR,
@@ -630,9 +689,26 @@ class SecAggPlusPlusWorkflow:  # pylint: disable=too-many-instance-attributes
                     nid,
                 )
                 return False
+            t0 = perf_counter()
             u_seed = combine_shares(share_list)
-            u_mask = pseudo_rand_gen(u_seed, state.mod_range, param_dimensions)
+            mid = perf_counter()
+            u_mask = pseudo_rand_gen_secure(u_seed, state.mod_range, param_dimensions)
             params = parameters_subtraction(params, u_mask)
+            t1 = perf_counter()
+            t_combine_shares += mid - t0
+            t_prg_and_sub += t1 - mid
+            t_self_unmask += t1 - t0
+
+        log(
+            INFO,
+            "Stage3 self_unmask: combine=%.4fs prg+sub=%.4fs total=%.4fs n_clients=%d share_counts=%s",
+            t_combine_shares,
+            t_prg_and_sub,
+            t_self_unmask,
+            len(p2_clients),
+            share_counts,
+        )
+        state.timing_log["Stage3_self_unmask"] = t_self_unmask
 
         masked_vector = [factor[0]] + parameters_mod(params, state.mod_range)
 
